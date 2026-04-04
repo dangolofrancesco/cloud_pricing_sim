@@ -5,9 +5,22 @@ import os
 # Ensure your local data directory exists
 os.makedirs("data/raw", exist_ok=True)
 
-# Initialize the BigQuery client 
+# Read the GCP project ID from the environment variable GCP_PROJECT_ID
+# Set it in a .env file or export it before running:
+#   export GCP_PROJECT_ID=your-gcp-project-id
+project_id = os.environ.get("GCP_PROJECT_ID")
+if not project_id:
+    raise EnvironmentError(
+        "GCP_PROJECT_ID environment variable is not set. "
+        "Please set it to your GCP project ID before running this script.\n"
+        "  export GCP_PROJECT_ID=your-gcp-project-id\n"
+        "Also ensure you have authenticated via:\n"
+        "  gcloud auth application-default login"
+    )
+
+# Initialize the BigQuery client
 # (Make sure you have authenticated your environment using `gcloud auth application-default login`)
-client = bigquery.Client()
+client = bigquery.Client(project=project_id)
 
 print("Fetching real Instance Events sample...")
 # Query the instance_events table from Cell A
