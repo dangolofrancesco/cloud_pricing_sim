@@ -12,5 +12,5 @@ matplotlib==3.8.3
 seaborn==0.13.2
 
 # Development & Testing
-jupyterlab==4.1.5
+jupyterlab==4.2.5
 pytest==8.1.1
