@@ -1,0 +1,16 @@
+# Data Manipulation & Math
+numpy==1.26.4
+pandas==2.2.1
+scipy==1.12.0  # Crucial for the Lognormal distributions & Myerson transformations
+
+# Google Trace Ingestion
+google-cloud-bigquery==3.19.0
+db-dtypes==1.2.0  # Required by BigQuery to convert to Pandas DataFrames
+
+# Visualization for Notebooks (Pareto Fronts, Discretization Error)
+matplotlib==3.8.3
+seaborn==0.13.2
+
+# Development & Testing
+jupyterlab==4.1.5
+pytest==8.1.1
