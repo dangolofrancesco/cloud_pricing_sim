@@ -5,29 +5,36 @@ import os
 
 load_dotenv()
 
-# Ensure your local data directory exists
 os.makedirs("data/raw", exist_ok=True)
-
-# Read the GCP project ID from the environment variable GCP_PROJECT_ID
-# Set it in a .env file or export it before running:
-#   export GCP_PROJECT_ID=your-gcp-project-id
 project_id = os.getenv("GCP_PROJECT_ID")
 
 if not project_id:
-    raise EnvironmentError(
-        "GCP_PROJECT_ID environment variable is not set. "
-        "Please set it to your GCP project ID before running this script.\n"
-        "  export GCP_PROJECT_ID=your-gcp-project-id\n"
-        "Also ensure you have authenticated via:\n"
-        "  gcloud auth application-default login"
-    )
+    raise EnvironmentError("GCP_PROJECT_ID environment variable is not set.")
 
-# Initialize the BigQuery client
-# (Make sure you have authenticated your environment using `gcloud auth application-default login`)
 client = bigquery.Client(project=project_id)
 
-print("Fetching real Instance Events sample...")
-# Fixed: Use dot notation for nested struct fields in BigQuery
+print("Step 1: Sampling 500 exact unique Job IDs...")
+# We run this ONCE to lock in our exact sample of jobs
+query_jobs = """
+    SELECT DISTINCT collection_id
+    FROM `google.com:google-cluster-data.clusterdata_2019_a.instance_events`
+    WHERE type = 0 
+    AND RAND() < 0.05
+    LIMIT 500
+"""
+jobs_df = client.query(query_jobs).to_dataframe()
+sampled_job_ids = jobs_df['collection_id'].tolist()
+
+print(f"Successfully locked in {len(sampled_job_ids)} specific jobs.")
+
+# We pass this exact list of IDs as a parameter to guarantee 100% intersection
+job_config = bigquery.QueryJobConfig(
+    query_parameters=[
+        bigquery.ArrayQueryParameter("job_ids", "INT64", sampled_job_ids)
+    ]
+)
+
+print("\nStep 2: Fetching Instance Events for these specific jobs...")
 query_events = """
     SELECT 
         collection_id, 
@@ -38,13 +45,13 @@ query_events = """
         machine_id
     FROM `google.com:google-cluster-data.clusterdata_2019_a.instance_events`
     WHERE type = 0 
-    LIMIT 10000
+    AND collection_id IN UNNEST(@job_ids)
 """
-events_df = client.query(query_events).to_dataframe()
+events_df = client.query(query_events, job_config=job_config).to_dataframe()
 events_df.to_csv("data/raw/sample_instance_events.csv", index=False)
+print(f" -> Downloaded {len(events_df)} event tasks.")
 
-print("Fetching real Instance Usage sample...")
-# Fixed: Use dot notation for nested struct fields in BigQuery
+print("\nStep 3: Fetching Instance Usage for these exact same jobs...")
 query_usage = """
     SELECT 
         collection_id, 
@@ -53,9 +60,10 @@ query_usage = """
         average_usage.cpus AS average_usage_cpus, 
         average_usage.memory AS average_usage_memory
     FROM `google.com:google-cluster-data.clusterdata_2019_a.instance_usage`
-    LIMIT 50000
+    WHERE collection_id IN UNNEST(@job_ids)
 """
-usage_df = client.query(query_usage).to_dataframe()
+usage_df = client.query(query_usage, job_config=job_config).to_dataframe()
 usage_df.to_csv("data/raw/sample_instance_usage.csv", index=False)
+print(f" -> Downloaded {len(usage_df)} usage histograms.")
 
-print("Samples saved successfully to data/raw/!")
+print("\nSamples successfully synchronized and saved to data/raw/!")

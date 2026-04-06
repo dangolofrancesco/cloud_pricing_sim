@@ -208,3 +208,6 @@ __marimo__/
 
 # data files
 data/
+
+# scripts
+scripts/
