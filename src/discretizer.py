@@ -54,68 +54,105 @@ class Discretizer:
         
         return edges[bin_indices]
 
-    def calculate_discretization_error(self, continuous_rewards: np.ndarray, discrete_rewards: np.ndarray) -> float:
+    def calculate_financial_loss(
+        self,
+        v_continuous: np.ndarray,
+        v_discrete: np.ndarray,
+        return_details: bool = False,
+    ):
         """
-        Calculates the Total Revenue Loss strictly due to discretization.
+        Metric 1: Pure Financial Revenue Loss (The "Accounting" Metric)
+        Calculates exactly how much cash the discretization strategy lost the business.
+        Formula: Sum( V_j - \hat{V}_j )
+
+        If return_details=True, also returns aggregate sums for both valuation
+        arrays as (loss, sum_continuous, sum_discrete).
         """
-        return np.sum(continuous_rewards) - np.sum(discrete_rewards)
+        # Ensure we don't have negative losses (Individual Rationality check)
+        # The discrete price should never exceed the continuous willingness to pay.
+        loss_array = v_continuous - v_discrete
 
+        loss = float(np.sum(loss_array))
+        if not return_details:
+            return loss
 
-def _run_local_test() -> None:
-    """
-    Local smoke test for discretization quality on the processed static batch CSV.
-    """
-    base_dir = Path(__file__).resolve().parents[1]
-    dataset_path = base_dir / "data" / "processed" / "static_batch_may2019.csv"
+        sum_continuous = float(np.sum(v_continuous))
+        sum_discrete = float(np.sum(v_discrete))
+        return loss, sum_continuous, sum_discrete
 
-    if not dataset_path.exists():
-        raise FileNotFoundError(
-            f"Dataset not found at {dataset_path}. Build it first with scripts/build_processed_dataset.py"
-        )
+    def calculate_objective_loss(self, phi_continuous: np.ndarray, phi_discrete: np.ndarray, 
+                                 q_j: np.ndarray, lambda_2: float = 1.0) -> float:
+        """
+        Metric 2: The Oracle's Objective Loss (The "Algorithmic" Metric)
+        Calculates how much the discretization hurt the DLENT algorithm's internal objective.
+        Formula: Sum( lambda_2 * q_j * ( \Phi_j - \hat{\Phi}_j ) )
+        """
+        # Element-wise multiplication of the algorithmic loss
+        algorithmic_loss_array = lambda_2 * q_j * (phi_continuous - phi_discrete)
+        
+        return np.sum(algorithmic_loss_array)
 
-    df = pd.read_csv(dataset_path)
-    if "phi_v" not in df.columns:
-        raise ValueError("Column 'phi_v' not found in processed dataset.")
-
-    sample_n = min(2000, len(df))
-    sample_df = df.sample(n=sample_n, random_state=42)
-    phi = sample_df["phi_v"].to_numpy(dtype=float)
-
-    K = 16
-    discretizer = Discretizer(K_bins=K)
-
-    phi_valid = discretizer._enforce_bounds(phi)
-    if len(phi_valid) == 0:
-        raise ValueError("No positive phi_v values available in sampled data.")
-
-    uniform_disc = discretizer.uniform_grid(phi_valid)
-    geometric_disc = discretizer.geometric_grid(phi_valid)
-
-    uniform_loss = discretizer.calculate_discretization_error(phi_valid, uniform_disc)
-    geometric_loss = discretizer.calculate_discretization_error(phi_valid, geometric_disc)
-
-    def summarize(name: str, disc_values: np.ndarray, loss: float) -> None:
-        used_bins = len(np.unique(disc_values))
-        non_monotone_count = int(np.sum(disc_values > phi_valid))
-        print(f"\n{name} results")
-        print(f"- used bins: {used_bins}/{K}")
-        print(f"- total loss: {loss:.8f}")
-        print(f"- avg loss per job: {loss / len(phi_valid):.8f}")
-        print(f"- values above original (should be ~0 for lower-bound discretization): {non_monotone_count}")
-        print(
-            f"- discretized min/median/max: "
-            f"{np.min(disc_values):.8f} / {np.median(disc_values):.8f} / {np.max(disc_values):.8f}"
-        )
-
-    print("=== Discretizer Local Test ===")
-    print(f"dataset: {dataset_path}")
-    print(f"rows in dataset: {len(df)}")
-    print(f"sample size: {sample_n}")
-    print(f"positive phi_v in sample: {len(phi_valid)}")
-
-    summarize("Uniform grid", uniform_disc, uniform_loss)
-    summarize("Geometric grid", geometric_disc, geometric_loss)
-
-
+# --- Local Test Execution Block ---
 if __name__ == "__main__":
-    _run_local_test()
+    import os
+    import time
+
+    # 1. Define paths assuming the script is run from the project root
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_path = os.path.join(base_dir, "data", "processed", "static_batch_may2019.csv")
+
+    print("=== Discretizer Local Test: Two-Metric Loss Evaluation ===")
+    print(f"Loading dataset from: {data_path}")
+    
+    if not os.path.exists(data_path):
+        print("ERROR: Processed dataset not found. Please run build_processed_dataset.py first.")
+    else:
+        # 2. Load dataset and enforce Individual Rationality (Mechanism Rejection)
+        df = pd.read_csv(data_path)
+        valid_df = df[df['phi_v'] > 0].copy()
+        
+        print(f"Total jobs requested: {len(df)}")
+        print(f"Jobs accepted by Mechanism (phi_v > 0): {len(valid_df)}\n")
+
+        # 3. Extract continuous arrays and parameters
+        v_continuous = valid_df['v'].values
+        phi_continuous = valid_df['phi_v'].values
+        q_j = valid_df['q_j'].values
+        
+        # Oracle Weighting Parameter (Lambda_2)
+        # Represents the strategic weight the provider places on Profit vs. Sustainability
+        LAMBDA_2 = 1.0  
+        K_BINS = 16
+        
+        discretizer = Discretizer(K_bins=K_BINS)
+
+        # 4. Define a helper function to evaluate and print metrics for any grid method
+        def evaluate_grid(name: str, grid_func):
+            start_time = time.perf_counter()
+            
+            # Discretize both spaces independently as per the theoretical mapping
+            phi_discrete = grid_func(phi_continuous)
+            v_discrete = grid_func(v_continuous)
+            
+            execution_time = time.perf_counter() - start_time
+            
+            # Calculate the two distinct metrics
+            financial_loss, v_cont_sum, v_disc_sum = discretizer.calculate_financial_loss(
+                v_continuous,
+                v_discrete,
+                return_details=True,
+            )
+            objective_loss = discretizer.calculate_objective_loss(phi_continuous, phi_discrete, q_j, lambda_2=LAMBDA_2)
+            
+            print(f"--- {name} Grid (K={K_BINS}) ---")
+            print(f"  Total Continuous Valuation : ${v_cont_sum:.2f}")
+            print(f"  Total Discrete Valuation   : ${v_disc_sum:.2f}")
+            print(f"  Pure Financial Cash Loss : ${financial_loss:.2f}")
+            print(f"  Oracle's Objective Loss  : {objective_loss:.4f}")
+            print(f"  Execution Time           : {execution_time:.4f} seconds\n")
+
+        # 5. Run the evaluations
+        evaluate_grid("Uniform (Arithmetic)", discretizer.uniform_grid)
+        evaluate_grid("Geometric (Multiplicative)", discretizer.geometric_grid)
+        
+        print("Test completed successfully!")

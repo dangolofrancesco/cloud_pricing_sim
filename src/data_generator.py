@@ -200,7 +200,7 @@ class DataGenerator:
         print("Static batch generation complete.")
         
         columns_to_show = [
-            'collection_id', 'job_datetime', 
+            'collection_id', 'job_datetime', 'q_j', 'scheduling_class',
             'A_cpu', 'A_ram', 'actual_cpu_usage', 'actual_ram_usage', 'D (hours)', 
             'v', 'phi_v', 'w_j_kw', 
             'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh', 
@@ -243,7 +243,7 @@ if __name__ == "__main__":
         
         # Retained all mechanism variables PLUS the new dynamic grid variables
         columns_to_show = [
-            'collection_id', 'job_datetime', 
+            'collection_id', 'job_datetime', 'q_j', 'scheduling_class',
             'A_cpu', 'A_ram', 'actual_cpu_usage', 'actual_ram_usage', 'D (hours)', 
             'v', 'phi_v', 'w_j_kw', 
             'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh', 
