@@ -54,6 +54,91 @@ class Discretizer:
         
         return edges[bin_indices]
 
+    def dp_optimal_grid(self, phi_array: np.ndarray) -> np.ndarray:
+        """
+        Baseline 3: Dynamic Programming Optimal Grid.
+        Finds the exact K bin boundaries that minimize Revenue Loss for the given dataset.
+        Complexity: O(K * N^2) - Optimized with Numpy Vectorization
+        """
+        phi_valid = self._enforce_bounds(phi_array)
+        if len(phi_valid) == 0:
+            return np.array([])
+
+        # 1. Sort the virtual values to create a monotonic sequence
+        V = np.sort(phi_valid)
+        N = len(V)
+
+        # If we have fewer jobs than available bins, everyone gets their exact continuous price
+        if N <= self.K:
+            return phi_valid
+
+        # 2. Precompute the Cost Matrix (Revenue Loss for any segment V[i...j])
+        # cost_matrix[i, j] = sum(V[i...j]) - (j - i + 1) * V[i]
+        cost_matrix = np.zeros((N, N))
+
+        # We optimize this by precomputing cumulative sums
+        cum_V = np.insert(np.cumsum(V), 0, 0) # insert 0 for easy indexing
+
+        for i in range(N):
+            # For a fixed 'i', calculate cost for all 'j >= i' simultaneously (Vectorized)
+            # Sum of V[i...j] is cum_V[j+1] - cum_V[i]
+            # Number of elements is (j - i + 1)
+            j_indices = np.arange(i, N)
+            segment_sums = cum_V[j_indices + 1] - cum_V[i]
+            bin_revenues = (j_indices - i + 1) * V[i]
+            cost_matrix[i, i:] = segment_sums - bin_revenues
+
+        # 3. Initialize DP Tables
+        # dp[k][j] = min loss to cover the first 'j' elements using exactly 'k' bins
+        dp = np.full((self.K + 1, N), np.inf)
+
+        # tracker[k][j] = the starting index 'i' of the optimal last bin
+        tracker = np.zeros((self.K + 1, N), dtype=int)
+
+        # Base case: k=1 (Using exactly 1 bin for the first j elements)
+        for j in range(N):
+            dp[1, j] = cost_matrix[0, j]
+            tracker[1, j] = 0
+
+        # 4. Fill DP Table (The Bellman Equation)
+        for k in range(2, self.K + 1):
+            for j in range(k - 1, N):
+                # We want to find the split point 'i' that minimizes:
+                # dp[k-1][i-1] (cost of previous bins) + cost_matrix[i][j] (cost of current bin)
+
+                # Possible split points: k-1 <= i <= j
+                i_candidates = np.arange(k - 1, j + 1)
+
+                # Calculate total costs for all candidates instantly (Vectorized)
+                prev_costs = dp[k - 1, i_candidates - 1]
+                curr_costs = cost_matrix[i_candidates, j]
+                total_costs = prev_costs + curr_costs
+
+                # Find the index that gives the absolute minimum loss
+                best_idx = np.argmin(total_costs)
+                dp[k, j] = total_costs[best_idx]
+                tracker[k, j] = i_candidates[best_idx]
+
+        # 5. Backtrack to find the optimal lower bounds (L_k)
+        bin_starts = []
+        curr_j = N - 1
+        for k in range(self.K, 0, -1):
+            start_i = tracker[k, curr_j]
+            bin_starts.append(V[start_i])  # The price of the bin is the value at the start index
+            curr_j = start_i - 1
+
+        bin_starts.reverse() # We collected them backwards, so reverse them
+
+        # 6. Map the original UNSORTED array to these optimal bins
+        edges = np.array(bin_starts)
+        edges = np.append(edges, np.inf) # Add infinity to catch the top edge
+
+        # Use digitize to drop jobs into the exact optimal bins
+        bin_indices = np.digitize(phi_valid, edges) - 1
+        bin_indices = np.clip(bin_indices, 0, self.K - 1)
+
+        return edges[bin_indices]
+
     def calculate_financial_loss(
         self,
         v_continuous: np.ndarray,
@@ -154,5 +239,6 @@ if __name__ == "__main__":
         # 5. Run the evaluations
         evaluate_grid("Uniform (Arithmetic)", discretizer.uniform_grid)
         evaluate_grid("Geometric (Multiplicative)", discretizer.geometric_grid)
-        
+        evaluate_grid("DP Optimal", discretizer.dp_optimal_grid)
+
         print("Test completed successfully!")

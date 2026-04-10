@@ -112,7 +112,7 @@ class DataGenerator:
             }
         return self.energy_data
 
-    def synthesize_valuations(self, df: pd.DataFrame, base_val_multiplier: float = 100.0, sigma: float = 0.5) -> pd.DataFrame:
+    def synthesize_valuations(self, df: pd.DataFrame, base_val_multiplier: float = 1.0, sigma: float = 0.5) -> pd.DataFrame:
         df = df.copy()
         demand_score = df['A_cpu'] + df['A_ram']
         expected_v = np.maximum(demand_score * base_val_multiplier, 1e-4) 
@@ -120,20 +120,25 @@ class DataGenerator:
         
         df['v_mu'] = mu_array
         df['v_sigma'] = sigma
-        df['v'] = np.random.lognormal(mean=mu_array, sigma=sigma)
+        df['v_rate'] = np.random.lognormal(mean=mu_array, sigma=sigma)
+        df['v_total'] = df['v_rate'] * df['D (hours)']
+
         return df
 
     def apply_myerson_transformation(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         s = df['v_sigma'].values
         scale = np.exp(df['v_mu'].values)
-        v = df['v'].values
+        v_rate = df['v_rate'].values
         
-        F_v = lognorm.cdf(v, s=s, scale=scale)
-        f_v = lognorm.pdf(v, s=s, scale=scale)
+        F_v = lognorm.cdf(v_rate, s=s, scale=scale)
+        f_v = lognorm.pdf(v_rate, s=s, scale=scale)
         
         inv_hazard = np.where(f_v > 1e-8, (1.0 - F_v) / f_v, 0.0)
-        df['phi_v'] = v - inv_hazard
+        df['phi_rate'] = v_rate - inv_hazard
+
+        df['phi_total'] = df['phi_rate'] * df['D (hours)']
+
         return df
 
     def generate_static_batch(
@@ -202,7 +207,7 @@ class DataGenerator:
         columns_to_show = [
             'collection_id', 'job_datetime', 'q_j', 'scheduling_class',
             'A_cpu', 'A_ram', 'actual_cpu_usage', 'actual_ram_usage', 'D (hours)', 
-            'v', 'phi_v', 'w_j_kw', 
+            'v_rate', 'v_total', 'phi_rate', 'phi_total', 'w_j_kw', 
             'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh', 
             'C_elec', 'C_carbon'
         ]
@@ -245,9 +250,9 @@ if __name__ == "__main__":
         columns_to_show = [
             'collection_id', 'job_datetime', 'q_j', 'scheduling_class',
             'A_cpu', 'A_ram', 'actual_cpu_usage', 'actual_ram_usage', 'D (hours)', 
-            'v', 'phi_v', 'w_j_kw', 
+            'v_rate', 'v_total', 'phi_rate', 'phi_total', 'w_j_kw', 
             'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh', 
-            'C_elec', 'C_carbon'
+    
         ]
         
         pd.set_option('display.max_columns', None)
@@ -257,6 +262,6 @@ if __name__ == "__main__":
         
         print("\n--- Validation Checks ---")
         print(f"Total jobs in batch: {len(batch_df)}")
-        print(f"Any null values in virtual value (phi_v)? : {batch_df['phi_v'].isnull().any()}")
+        print(f"Any null values in virtual value (phi_v)? : {batch_df['phi_total'].isnull().any()}")
         print(f"Any null values in dynamic pricing? : {batch_df['elec_price_per_kWh'].isnull().any()}")
         print("\nTest completed successfully!")
