@@ -1,0 +1,40 @@
+============================================================================
+  DP Scaling Test — three strategies
+  Fixed K=16  |  Theoretical K (formula)  |  Optimal K search (2..30)
+  Phases: 4  |  Initial batch: 500 jobs
+============================================================================
+
+  Phase 1  |  N=500
+    Fixed        (K= 16):  Error=     96.9095  |  Time=0.0872s
+    Theoretical  (K=  3):  Error=    657.0402  |  Time=0.0155s
+    Optimal K*   (K= 30):  Error=     38.5644  |  Search time=2.5057s (sweep K=2..30)
+
+  Phase 2  |  N=1,000
+    Fixed        (K= 16):  Error=    224.2496  |  Time=0.1961s
+    Theoretical  (K=  3):  Error=   1054.9862  |  Time=0.0348s
+    Optimal K*   (K= 30):  Error=    101.6268  |  Search time=6.2234s (sweep K=2..30)
+
+  Phase 3  |  N=2,000
+    Fixed        (K= 16):  Error=    451.5272  |  Time=0.8619s
+    Theoretical  (K=  3):  Error=   2042.7797  |  Time=0.1297s
+    Optimal K*   (K= 30):  Error=    200.0350  |  Search time=18.0812s (sweep K=2..30)
+
+  Phase 4  |  N=4,000
+    Fixed        (K= 16):  Error=   1003.3712  |  Time=2.1222s
+    Theoretical  (K=  4):  Error=   4047.3452  |  Time=0.5556s
+    Optimal K*   (K= 30):  Error=    428.9269  |  Search time=60.4015s (sweep K=2..30)
+
+============================================================================
+  TOTALS ACROSS 4 PHASES
+============================================================================
+  Fixed       K=16:  Total Error=   1776.0575  |  Total Time=3.2674s
+  Theoretical K (formula):  Total Error=   7802.1512  |  Total Time=0.7356s
+  Optimal K*  (search 2..30):  Total Error=    769.1532  |  Total Time=87.2118s
+============================================================================
+
+   Phase  Batch_Size  K_Fixed  K_Theoretical  K_Star  Error_Fixed  Error_Theoretical  Error_Optimal  Time_Fixed_sec  Time_Theoretical_sec  Time_Search_sec
+0      1         500       16              3      30    96.909469         657.040170      38.564408        0.087208              0.015508         2.505696
+1      2        1000       16              3      30   224.249605        1054.986185     101.626810        0.196095              0.034794         6.223409
+2      3        2000       16              3      30   451.527189        2042.779705     200.034991        0.861866              0.129658        18.081179
+3      4        4000       16              4      30  1003.371246        4047.345177     428.926948        2.122245              0.555603        60.401500
+[rerun: b2]

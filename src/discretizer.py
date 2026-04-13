@@ -1,6 +1,8 @@
+import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from typing import List
 
 class Discretizer:
     """
@@ -176,6 +178,281 @@ class Discretizer:
         algorithmic_loss_array = lambda_2 * q_j * (phi_continuous - phi_discrete)
         
         return np.sum(algorithmic_loss_array)
+
+    # ------------------------------------------------------------------
+    # Convergence & scaling analysis (static methods — no instance state)
+    # ------------------------------------------------------------------
+
+    _METHOD_MAP = {
+        "Uniform":    lambda d: d.uniform_grid,
+        "Geometric":  lambda d: d.geometric_grid,
+        "DP Optimal": lambda d: d.dp_optimal_grid,
+    }
+
+    @staticmethod
+    def _theoretical_k(w: int) -> int:
+        """
+        Theoretical upper bound on K for a phase with W jobs:
+
+            K_m = ceil( (W^{(m-1)} / ln W^{(m-1)})^{1/5} )
+
+        Enforces K >= 2 so the DP always has at least two bins.
+        """
+        return max(2, int(np.ceil((w / np.log(w)) ** 0.2)))
+
+    @staticmethod
+    def run_convergence_test(
+        method_name: str,
+        v_values: np.ndarray,
+        phi_values: np.ndarray,
+        q_values: np.ndarray,
+        max_financial_continuous: float,
+        max_objective_continuous: float,
+        lambda_2: float = 1.0,
+        start_k: int = 2,
+        step_k: int = 2,
+        max_k: int = 500,
+        target_threshold_pct: float = 0.1,
+    ) -> pd.DataFrame:
+        """
+        Sweeps K bins from start_k to max_k, evaluating financial and objective loss.
+        Stops early when the marginal improvement in financial loss drops below
+        target_threshold_pct between two consecutive steps.
+
+        Note: for 'DP Optimal', complexity is O(K * N^2). Keep max_k small (<=50)
+        for datasets with N > 1000 to maintain reasonable runtimes.
+        """
+        if method_name not in Discretizer._METHOD_MAP:
+            raise ValueError(
+                f"Unknown method '{method_name}'. Choose from: {list(Discretizer._METHOD_MAP.keys())}"
+            )
+
+        rows = []
+        prev_financial_loss = None
+
+        for k in range(start_k, max_k + 1, step_k):
+            disc = Discretizer(K_bins=k)
+            grid_func = Discretizer._METHOD_MAP[method_name](disc)
+
+            start = time.perf_counter()
+            v_discrete = grid_func(v_values)
+            phi_discrete = grid_func(phi_values)
+            elapsed = time.perf_counter() - start
+
+            financial_loss = float(disc.calculate_financial_loss(v_values, v_discrete))
+            objective_loss = float(
+                disc.calculate_objective_loss(phi_values, phi_discrete, q_values, lambda_2=lambda_2)
+            )
+            financial_loss_pct = (
+                (financial_loss / max_financial_continuous) * 100
+                if max_financial_continuous else np.nan
+            )
+            objective_loss_pct = (
+                (objective_loss / max_objective_continuous) * 100
+                if max_objective_continuous else np.nan
+            )
+            improvement_pct = (
+                np.nan
+                if prev_financial_loss is None
+                else ((prev_financial_loss - financial_loss) / prev_financial_loss) * 100
+                if prev_financial_loss != 0
+                else 0.0
+            )
+
+            rows.append({
+                "Method": method_name,
+                "K": k,
+                "Financial_Loss": financial_loss,
+                "Financial_Loss_pct": financial_loss_pct,
+                "Objective_Loss": objective_loss,
+                "Objective_Loss_pct": objective_loss_pct,
+                "Execution_Time_sec": elapsed,
+                "Improvement_pct": improvement_pct,
+            })
+
+            if (
+                prev_financial_loss is not None
+                and not np.isnan(improvement_pct)
+                and improvement_pct < target_threshold_pct
+            ):
+                break
+            prev_financial_loss = financial_loss
+
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def run_dp_scaling_test(
+        v_continuous: np.ndarray,
+        initial_batch_size: int = 500,
+        n_phases: int = None,
+        K_fixed: int = 16,
+        k_search_max: int = 30,
+        k_search_threshold_pct: float = 1.0,
+    ) -> pd.DataFrame:
+        """
+        Compares three DP grid strategies across phases where the batch doubles each round.
+
+        Phase batch sizes: initial_batch_size * 2^(phase-1).
+        Samples with replacement when batch_size > len(v_continuous).
+
+        Models
+        ------
+        1. Fixed K        : K = K_fixed every phase.
+        2. Theoretical K  : K_m = ceil( (W^{(m-1)} / ln W^{(m-1)})^{1/5} )
+                            where W^{(m-1)} is the previous phase batch size.
+        3. Optimal K search: sweep K from 2..k_search_max, run DP at each K,
+                            pick K* = argmin(error). The reported time includes
+                            the entire sweep (cost of finding the best K).
+
+        Returns a DataFrame with per-phase metrics and prints a full summary.
+        """
+        # Shuffle once, then consume sequentially so phases are non-overlapping.
+        rng = np.random.default_rng(seed=42)
+        shuffled = rng.permutation(v_continuous)
+
+        rows = []
+        totals = {m: {"error": 0.0, "time": 0.0}
+                  for m in ("fixed", "theoretical", "optimal")}
+
+        phase_label = f"up to {n_phases}" if n_phases is not None else "until data exhausted"
+        sep = "=" * 76
+        print(f"\n{sep}")
+        print(f"  DP Scaling Test — three strategies")
+        print(f"  Fixed K={K_fixed}  |  Theoretical K (formula)  |  "
+              f"Optimal K search (2..{k_search_max}, stop if improvement < {k_search_threshold_pct}%)")
+        print(f"  Phases: {phase_label}  |  Initial batch: {initial_batch_size:,} jobs  "
+              f"|  Total available: {len(shuffled):,}")
+        print(f"{sep}")
+
+        offset = 0
+        prev_batch_size = initial_batch_size
+        batch_size = initial_batch_size
+        phase = 0
+
+        while True:
+            phase += 1
+            if n_phases is not None and phase > n_phases:
+                break
+            remaining = len(shuffled) - offset
+            if remaining == 0:
+                print(f"\n  Phase {phase}: no data remaining — stopping.")
+                break
+
+            # Use all remaining jobs if fewer than the full batch size
+            batch = shuffled[offset: offset + batch_size]
+            actual_n = len(batch)
+            offset += actual_n
+            if actual_n < batch_size:
+                print(f"\n  Phase {phase}: only {actual_n:,} jobs remain "
+                      f"(expected {batch_size:,}) — running with reduced batch.")
+
+            # Total continuous revenue of this batch (denominator for % error)
+            batch_total = float(np.sum(batch))
+
+            # ── 1. Fixed-K DP ─────────────────────────────────────────────────
+            disc = Discretizer(K_bins=K_fixed)
+            t0 = time.perf_counter()
+            v_disc = disc.dp_optimal_grid(batch)
+            time_fixed = time.perf_counter() - t0
+            error_fixed = float(disc.calculate_financial_loss(batch, v_disc))
+
+            # ── 2. Theoretical-K DP ───────────────────────────────────────────
+            K_theoretical = Discretizer._theoretical_k(prev_batch_size)
+            disc = Discretizer(K_bins=K_theoretical)
+            t0 = time.perf_counter()
+            v_disc = disc.dp_optimal_grid(batch)
+            time_theoretical = time.perf_counter() - t0
+            error_theoretical = float(disc.calculate_financial_loss(batch, v_disc))
+
+            # ── 3. Optimal K search ───────────────────────────────────────────
+            # Sweep K=2..k_search_max. Stop early when the marginal improvement
+            # drops below k_search_threshold_pct to find the "knee" of the curve.
+            best_k_star = 2
+            best_error_optimal = float("inf")
+            prev_err_k = float("inf")
+
+            t0_search = time.perf_counter()
+            for k in range(2, k_search_max + 1):
+                disc_k = Discretizer(K_bins=k)
+                v_disc_k = disc_k.dp_optimal_grid(batch)
+                err_k = float(disc_k.calculate_financial_loss(batch, v_disc_k))
+
+                if err_k < best_error_optimal:
+                    best_error_optimal = err_k
+                    best_k_star = k
+
+                # Early stop: improvement from previous K is below threshold
+                if prev_err_k < float("inf") and prev_err_k > 0:
+                    improvement_pct = (prev_err_k - err_k) / prev_err_k * 100
+                    if improvement_pct < k_search_threshold_pct:
+                        break
+
+                prev_err_k = err_k
+            time_optimal_search = time.perf_counter() - t0_search
+
+            # ── % of batch revenue lost (always in [0, 100]) ──────────────────
+            error_fixed_pct       = (error_fixed       / batch_total) * 100
+            error_theoretical_pct = (error_theoretical / batch_total) * 100
+            error_optimal_pct     = (best_error_optimal / batch_total) * 100
+
+            # ── Accumulate totals ─────────────────────────────────────────────
+            totals["fixed"]["error"]       += error_fixed
+            totals["fixed"]["time"]        += time_fixed
+            totals["theoretical"]["error"] += error_theoretical
+            totals["theoretical"]["time"]  += time_theoretical
+            totals["optimal"]["error"]     += best_error_optimal
+            totals["optimal"]["time"]      += time_optimal_search
+
+            rows.append({
+                "Phase":                   phase,
+                "Batch_Size":              actual_n,
+                "Batch_Total":             batch_total,
+                "K_Fixed":                 K_fixed,
+                "Error_Fixed":             error_fixed,
+                "Error_Fixed_pct":         error_fixed_pct,
+                "Time_Fixed_sec":          time_fixed,
+                "K_Theoretical":           K_theoretical,
+                "Error_Theoretical":       error_theoretical,
+                "Error_Theoretical_pct":   error_theoretical_pct,
+                "Time_Theoretical_sec":    time_theoretical,
+                "K_Star":                  best_k_star,
+                "Error_Optimal":           best_error_optimal,
+                "Error_Optimal_pct":       error_optimal_pct,
+                "Time_Search_sec":         time_optimal_search,
+            })
+
+            print(f"\n  Phase {phase}  |  N={actual_n:,}  |  Batch revenue={batch_total:.2f}")
+            print(f"    Fixed        (K={K_fixed:3d}):  "
+                  f"Error={error_fixed:10.4f} ({error_fixed_pct:5.2f}% of batch)"
+                  f"  |  Time={time_fixed:.4f}s")
+            print(f"    Theoretical  (K={K_theoretical:3d}):  "
+                  f"Error={error_theoretical:10.4f} ({error_theoretical_pct:5.2f}% of batch)"
+                  f"  |  Time={time_theoretical:.4f}s")
+            print(f"    Optimal K*   (K={best_k_star:3d}):  "
+                  f"Error={best_error_optimal:10.4f} ({error_optimal_pct:5.2f}% of batch)"
+                  f"  |  Search time={time_optimal_search:.4f}s "
+                  f"(converged at K={best_k_star}, max={k_search_max})")
+
+            prev_batch_size = actual_n
+            batch_size *= 2
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        n_ran = len(rows)
+        print(f"\n{sep}")
+        print(f"  TOTALS ACROSS {n_ran} PHASES")
+        print(f"{sep}")
+        for label, key in [
+            (f"Fixed       K={K_fixed}", "fixed"),
+            ("Theoretical K (formula)", "theoretical"),
+            (f"Optimal K*  (search 2..{k_search_max})", "optimal"),
+        ]:
+            print(f"  {label}:  "
+                  f"Total Error={totals[key]['error']:12.4f}  |  "
+                  f"Total Time={totals[key]['time']:.4f}s")
+        print(f"{sep}\n")
+
+        return pd.DataFrame(rows)
+
 
 # --- Local Test Execution Block ---
 if __name__ == "__main__":

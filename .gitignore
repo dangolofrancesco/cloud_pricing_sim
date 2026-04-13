@@ -211,3 +211,6 @@ data/
 
 # scripts
 scripts/
+
+# Claude 
+.claude/settings.json
