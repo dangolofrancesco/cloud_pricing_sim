@@ -101,8 +101,30 @@ class DataGenerator:
         Loads local Chicago/Argonne physical carbon intensity data and electricity pricing.
         """
         if energy_filepath and os.path.exists(energy_filepath):
-            # ADDED: Parse the timestamp column properly
-            self.energy_data = pd.read_csv(energy_filepath, parse_dates=['timestamp'])
+            self.energy_data = pd.read_csv(energy_filepath)
+
+            if 'timestamp_utc' in self.energy_data.columns:
+                ts_col = 'timestamp_utc'
+            elif 'timestamp' in self.energy_data.columns:
+                ts_col = 'timestamp'
+            else:
+                raise ValueError(
+                    "Energy CSV must contain either 'timestamp_utc' or 'timestamp' column."
+                )
+
+            required_cols = {'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh'}
+            missing = required_cols.difference(self.energy_data.columns)
+            if missing:
+                raise ValueError(
+                    f"Energy CSV missing required columns: {sorted(missing)}"
+                )
+
+            self.energy_data[ts_col] = pd.to_datetime(self.energy_data[ts_col]).dt.tz_localize(None)
+            self.energy_data = self.energy_data.rename(columns={ts_col: 'timestamp_utc'})
+            self.energy_data = self.energy_data[
+                ['timestamp_utc', 'elec_price_per_kWh', 'carbon_intensity_gCO2_per_kWh']
+            ]
+            self.energy_data = self.energy_data.drop_duplicates(subset=['timestamp_utc']).sort_values('timestamp_utc')
             print(f"Loaded dynamic grid data: {len(self.energy_data)} hourly records.")
         else:
             print("No energy file provided. Using default Argonne/Chicago static parameters.")
@@ -178,18 +200,24 @@ class DataGenerator:
         
         # DYNAMIC GRID MAPPING LOGIC 
         if isinstance(self.energy_data, pd.DataFrame):
-            # 1. Round job start time down to the nearest hour to match the grid dataset
+            # 1. Round job start down so any hh:mm:ss maps to its containing hour bucket.
             batch['grid_hour'] = batch['job_datetime'].dt.floor('h')
             
             # 2. Merge the dynamic grid rates
-            batch = pd.merge(batch, self.energy_data, left_on='grid_hour', right_on='timestamp', how='left')
+            batch = pd.merge(
+                batch,
+                self.energy_data,
+                left_on='grid_hour',
+                right_on='timestamp_utc',
+                how='left'
+            )
             
             # 3. Apply costs (fill missing values with medians just in case a job falls out of bounds)
             elec_price = batch['elec_price_per_kWh'].fillna(0.035)
             grid_intensity = batch['carbon_intensity_gCO2_per_kWh'].fillna(350.0)
             
             # 4. Cleanup merging artifacts
-            batch = batch.drop(columns=['grid_hour', 'timestamp'])
+            batch = batch.drop(columns=['grid_hour', 'timestamp_utc'])
         else:
             # Fallback to static
             elec_price = self.energy_data.get('avg_elec_price', 0.04)
@@ -220,7 +248,7 @@ if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     events_path = os.path.join(base_dir, "data", "raw", "sample_instance_events_forced.csv")
     usage_path = os.path.join(base_dir, "data", "raw", "sample_instance_usage_forced.csv")
-    grid_path = os.path.join(base_dir, "data", "raw", "chicago_grid_may2019.csv")
+    grid_path = os.path.join(base_dir, "data", "raw", "chicago_grid_data_may_2019.csv")
 
     print(f"Checking for files...")
     if not os.path.exists(events_path) or not os.path.exists(usage_path) or not os.path.exists(grid_path):
