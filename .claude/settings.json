@@ -4,7 +4,9 @@
       "Bash(python3 -c ':*)",
       "Bash(python3 -)",
       "Bash(python -c ':*)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"from src.static_multiobjective_optimization import dominates, compute_pareto_front, ParetoFrontVisualizer; print\\('OK'\\)\")",
+      "Bash(python3 -c ' *)"
     ]
   }
 }
