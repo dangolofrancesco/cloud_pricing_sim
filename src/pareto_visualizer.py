@@ -208,29 +208,40 @@ class ParetoFrontVisualizer:
         idx_x = keys.index(obj_x)
         idx_y = keys.index(obj_y)
 
+        # Extract the full objective matrix (k dims) but when computing the
+        # Pareto front for a 2D projection we must evaluate dominance only
+        # on the two visible axes to avoid points that sacrifice X/Y for Z
+        # appearing on the plotted frontier.
         sol_matrix = _extract_objective_matrix(solutions, keys)
-        pareto_idx = _compute_pareto_indices_max(sol_matrix)
-        dominated_mask_sol = np.ones(len(solutions), dtype=bool)
-        dominated_mask_sol[pareto_idx] = False
 
-        # ── FIX-4: build the full pool for gray dots ───────────────────────
+        # Build an (N,2) matrix containing only the plotted coordinates
+        xy_matrix = sol_matrix[:, [idx_x, idx_y]]
+
+        # Recompute Pareto indices in the 2D plane (MAXIMIZATION)
+        pareto_idx_2d = _compute_pareto_indices_max(xy_matrix)
+        dominated_mask_sol = np.ones(len(solutions), dtype=bool)
+        dominated_mask_sol[pareto_idx_2d] = False
+
+        # Build the gray pool (dominated/background points) using the 2D
+        # projection coordinates. dominated_pool points are always plotted
+        # as background and do not affect frontier detection.
         if dominated_pool:
             dom_matrix = _extract_objective_matrix(dominated_pool, keys)
-            # All pool points — we label them dominated by definition
             pool_x = np.concatenate([
-                sol_matrix[dominated_mask_sol, idx_x],
+                xy_matrix[dominated_mask_sol, 0],
                 dom_matrix[:, idx_x],
             ])
             pool_y = np.concatenate([
-                sol_matrix[dominated_mask_sol, idx_y],
+                xy_matrix[dominated_mask_sol, 1],
                 dom_matrix[:, idx_y],
             ])
         else:
-            pool_x = sol_matrix[dominated_mask_sol, idx_x]
-            pool_y = sol_matrix[dominated_mask_sol, idx_y]
+            pool_x = xy_matrix[dominated_mask_sol, 0]
+            pool_y = xy_matrix[dominated_mask_sol, 1]
 
-        pareto_x = sol_matrix[pareto_idx, idx_x]
-        pareto_y = sol_matrix[pareto_idx, idx_y]
+        # Extract and sort only the 2D-dominant points for plotting the front
+        pareto_x = xy_matrix[pareto_idx_2d, 0]
+        pareto_y = xy_matrix[pareto_idx_2d, 1]
         sort_order = np.argsort(pareto_x)
         pareto_x = pareto_x[sort_order]
         pareto_y = pareto_y[sort_order]
