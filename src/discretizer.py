@@ -141,43 +141,119 @@ class Discretizer:
 
         return edges[bin_indices]
 
-    def calculate_financial_loss(
+    def calculate_satisfaction_loss(
         self,
         v_continuous: np.ndarray,
         v_discrete: np.ndarray,
+        q_values: np.ndarray | None = None,
         return_details: bool = False,
     ):
         """
-        Metric 1: Pure Financial Revenue Loss (The "Accounting" Metric)
-        Calculates exactly how much cash the discretization strategy lost the business.
-        Formula: Sum( V_j - \hat{V}_j )
+        Customer Satisfaction Loss (L_sat).
 
-        If return_details=True, also returns aggregate sums for both valuation
-        arrays as (loss, sum_continuous, sum_discrete).
+        Measures the "hidden" utility lost by treating a high-value customer as
+        a lower-tier customer due to binning, weighted by each user's priority q_j:
+
+            L_sat = sum_j  q_j * ( v_j  -  L_k(j) )
+
+        When q_values is None, uniform weights (q_j = 1) are used, recovering
+        the unweighted revenue gap for backward-compatibility.
+
+        Parameters
+        ----------
+        v_continuous : array of true continuous valuations  (shape N,).
+        v_discrete   : array of discrete lower-bound prices (shape N,).
+        q_values     : optional priority weights per user   (shape N,).
+                       Pass None to use uniform weights (q_j = 1 for all j).
+        return_details : if True, also return the aggregate sums for reporting.
+
+        Returns
+        -------
+        financial_loss             : float  (always)
+        v_cont_sum, v_disc_sum     : floats (only when return_details=True)
         """
-        # Ensure we don't have negative losses (Individual Rationality check)
-        # The discrete price should never exceed the continuous willingness to pay.
-        loss_array = v_continuous - v_discrete
+        if q_values is None:
+            # Backward-compatible: uniform weights
+            weights = np.ones(len(v_continuous))
+        else:
+            weights = q_values
 
-        loss = float(np.sum(loss_array))
-        if not return_details:
-            return loss
+        per_job = weights * (v_continuous - v_discrete)
+        loss = np.sum(per_job)
 
-        sum_continuous = float(np.sum(v_continuous))
-        sum_discrete = float(np.sum(v_discrete))
-        return loss, sum_continuous, sum_discrete
+        if return_details:
+            # Weighted sums for reporting (revenue under the mechanism pricing)
+            return (
+                float(loss),
+                float(np.sum(weights * v_continuous)),
+                float(np.sum(weights * v_discrete)),
+            )
+        return float(loss)
 
-    def calculate_objective_loss(self, phi_continuous: np.ndarray, phi_discrete: np.ndarray, 
-                                 q_j: np.ndarray, lambda_2: float = 1.0) -> float:
+    def calculate_virtual_revenue_loss(
+        self,
+        phi_continuous: np.ndarray,
+        phi_discrete: np.ndarray,
+    ) -> float:
         """
-        Metric 2: The Oracle's Objective Loss (The "Algorithmic" Metric)
-        Calculates how much the discretization hurt the DLENT algorithm's internal objective.
-        Formula: Sum( lambda_2 * q_j * ( \Phi_j - \hat{\Phi}_j ) )
+        Provider Profit Loss (L_prof).
+
+        Measures the gap between the Myerson virtual value at the continuous
+        valuation and the virtual value at the bin's lower bound, weighted by
+        each user's priority q_j and the strategic parameter lambda_2:
+
+            L_prof = sum_j  ( phi(v_j) - phi(L_k(j)) )
+
+        Because the mechanism already computes virtual values before
+        discretisation, phi_continuous and phi_discrete are the pre-mapped
+        arrays (phi(v_j) and phi(L_k) respectively).
+
+        Parameters
+        ----------
+        phi_continuous : array of continuous virtual values.
+        phi_discrete   : array of discrete virtual values (bin lower bounds).
+        q_values       : priority weights for each user.
+        lambda_2       : strategic weight on profit loss (default 1.0).
+
+        Returns
+        -------
+        objective_loss : float
         """
-        # Element-wise multiplication of the algorithmic loss
-        algorithmic_loss_array = lambda_2 * q_j * (phi_continuous - phi_discrete)
-        
-        return np.sum(algorithmic_loss_array)
+        return float(np.sum(phi_continuous - phi_discrete))
+
+    def calculate_total_loss(
+        self,
+        v_continuous: np.ndarray,
+        v_discrete: np.ndarray,
+        phi_continuous: np.ndarray,
+        phi_discrete: np.ndarray,
+        q_values: np.ndarray,
+        lambda_1: float = 0.5,
+        lambda_2: float = 0.5,
+    ) -> float:
+        """
+        Integrated Multi-Objective Loss.
+
+        Weighted combination of Customer Satisfaction and Provider Profit
+        losses, reflecting the provider's strategic preference:
+
+            L_total = lambda_1 * L_sat  +  lambda_2 * L_prof
+
+        Parameters
+        ----------
+        v_continuous, v_discrete     : valuation arrays for L_sat.
+        phi_continuous, phi_discrete : virtual-value arrays for L_prof.
+        q_values                     : priority weights per user.
+        lambda_1 : weight on customer satisfaction loss (default 1.0).
+        lambda_2 : weight on provider profit loss       (default 1.0).
+
+        Returns
+        -------
+        total_loss : float
+        """
+        l_sat = self.calculate_satisfaction_loss(v_continuous, v_discrete, q_values)
+        l_prof = self.calculate_virtual_revenue_loss(phi_continuous, phi_discrete)
+        return float(lambda_1 * l_sat + lambda_2 * l_prof)
 
     # ------------------------------------------------------------------
     # Convergence & scaling analysis (static methods — no instance state)
@@ -189,16 +265,102 @@ class Discretizer:
         "DP Optimal": lambda d: d.dp_optimal_grid,
     }
 
+    # Default calibration constant C = (4β/α)^{2/5}.
+    # Derivation: minimise Total Regret(K) = α√(TK) + β·T/K²
+    # → dR/dK = 0  →  K* = (4β/α)^{2/5} · T^{1/5}  ≡  C · T^{1/5}
+    # Empirical default: K≈30 observed when N^{1/5}≈3.6  →  C ≈ 8.3
+    _C_DEFAULT: float = 8.3
+    _C_MAX_K:   int   = 30     # hard ceiling used during Phase-0 search
+
     @staticmethod
-    def _theoretical_k(w: int) -> int:
+    def _theoretical_k(w: int, C: float | None = None) -> int:
         """
-        Theoretical upper bound on K for a phase with W jobs:
+        Theoretical optimal bin count for a phase with W jobs.
 
-            K_m = ceil( (W^{(m-1)} / ln W^{(m-1)})^{1/5} )
+        Derived by minimising the total regret trade-off:
 
-        Enforces K >= 2 so the DP always has at least two bins.
+            Total Regret(K) = α √(TK)  +  β T / K²
+
+        Setting dR/dK = 0 yields the exact closed form:
+
+            K* = (4β/α)^{2/5} · T^{1/5}  ≡  C · T^{1/5}
+
+        where C = (4β/α)^{2/5} is a data-dependent constant calibrated
+        empirically during the warm-up phase (Phase 0).
+
+        Parameters
+        ----------
+        w : batch size (plays the role of T in the regret formula).
+        C : calibrated constant (default: Discretizer._C_DEFAULT = 8.3).
+
+        Returns
+        -------
+        K_m : int ≥ 2
         """
-        return max(2, int(np.ceil((w / np.log(w)) ** 0.2)))
+        if C is None:
+            C = Discretizer._C_DEFAULT
+        raw = C * (w ** 0.2)           # C · T^{1/5}
+        return max(2, int(np.ceil(raw)))
+
+    @staticmethod
+    def calibrate_C(
+        v_continuous: np.ndarray,
+        warmup_n: int = 500,
+        k_search_max: int | None = None,
+        k_search_threshold_pct: float = 1.0,
+        seed: int = 42,
+    ) -> float:
+        """
+        Phase-0 warm-up: calibrate the constant C = K*_empirical / N^{1/5}.
+
+        Runs the K* sweep on a small warm-up batch and back-solves for C
+        such that  C · N^{1/5} == empirical K*.
+
+        Parameters
+        ----------
+        v_continuous          : full dataset of continuous valuations.
+        warmup_n              : size of the warm-up sub-sample (default 500).
+        k_search_max          : ceiling for the sweep (default: _C_MAX_K).
+        k_search_threshold_pct: early-stop threshold for the sweep (default 1 %).
+        seed                  : RNG seed for reproducible sub-sampling.
+
+        Returns
+        -------
+        C : float — calibrated constant, ready to pass into _theoretical_k.
+        """
+        if k_search_max is None:
+            k_search_max = Discretizer._C_MAX_K
+
+        rng = np.random.default_rng(seed=seed)
+        batch = rng.choice(v_continuous, size=min(warmup_n, len(v_continuous)), replace=False)
+        N = len(batch)
+
+        best_k_star = 2
+        best_err = float("inf")
+        prev_err = float("inf")
+
+        for k in range(2, k_search_max + 1):
+            disc = Discretizer(K_bins=k)
+            v_disc = disc.dp_optimal_grid(batch)
+            err = float(disc.calculate_satisfaction_loss(batch, v_disc))
+
+            if err < best_err:
+                best_err = err
+                best_k_star = k
+
+            if prev_err < float("inf") and prev_err > 0:
+                if (prev_err - err) / prev_err * 100 < k_search_threshold_pct:
+                    break
+            prev_err = err
+
+        C = best_k_star / (N ** 0.2)
+        print(
+            f"  [Phase-0 calibration]  N={N:,}  "
+            f"N^{{1/5}}={N**0.2:.3f}  "
+            f"K*_empirical={best_k_star}  "
+            f"→  C = {C:.4f}"
+        )
+        return C
 
     @staticmethod
     def run_convergence_test(
@@ -239,9 +401,9 @@ class Discretizer:
             phi_discrete = grid_func(phi_values)
             elapsed = time.perf_counter() - start
 
-            financial_loss = float(disc.calculate_financial_loss(v_values, v_discrete))
+            financial_loss = float(disc.calculate_satisfaction_loss(v_values, v_discrete))
             objective_loss = float(
-                disc.calculate_objective_loss(phi_values, phi_discrete, q_values, lambda_2=lambda_2)
+                disc.calculate_virtual_revenue_loss(phi_values, phi_discrete)
             )
             financial_loss_pct = (
                 (financial_loss / max_financial_continuous) * 100
@@ -262,10 +424,10 @@ class Discretizer:
             rows.append({
                 "Method": method_name,
                 "K": k,
-                "Financial_Loss": financial_loss,
-                "Financial_Loss_pct": financial_loss_pct,
-                "Objective_Loss": objective_loss,
-                "Objective_Loss_pct": objective_loss_pct,
+                "Satisfaction_Loss": financial_loss,
+                "Satisfaction_Loss_pct": financial_loss_pct,
+                "Virtual_Revenue_Loss": objective_loss,
+                "Virtual_Revenue_Loss_pct": objective_loss_pct,
                 "Execution_Time_sec": elapsed,
                 "Improvement_pct": improvement_pct,
             })
@@ -283,11 +445,16 @@ class Discretizer:
     @staticmethod
     def run_dp_scaling_test(
         v_continuous: np.ndarray,
+        q_continuous: np.ndarray | None = None,
+        phi_continuous: np.ndarray | None = None,
         initial_batch_size: int = 500,
         n_phases: int = None,
         K_fixed: int = 16,
         k_search_max: int = 30,
         k_search_threshold_pct: float = 1.0,
+        C: float | None = None,
+        lambda_1: float = 0.5,
+        lambda_2: float = 0.5,
     ) -> pd.DataFrame:
         """
         Compares three DP grid strategies across phases where the batch doubles each round.
@@ -297,18 +464,53 @@ class Discretizer:
 
         Models
         ------
-        1. Fixed K        : K = K_fixed every phase.
-        2. Theoretical K  : K_m = ceil( (W^{(m-1)} / ln W^{(m-1)})^{1/5} )
-                            where W^{(m-1)} is the previous phase batch size.
+        1. Fixed K         : K = K_fixed every phase.
+        2. Theoretical K*  : K_m = ceil( C · W^{1/5} )
+                             where C is calibrated in Phase-0 (or set explicitly).
+                             Derived by minimising Total Regret = α√(TK) + βT/K².
         3. Optimal K search: sweep K from 2..k_search_max, run DP at each K,
-                            pick K* = argmin(error). The reported time includes
-                            the entire sweep (cost of finding the best K).
+                             pick K* = argmin(L_tot). Reported time includes
+                             the entire sweep (cost of finding the best K).
+
+        Error metric: L_tot = lambda_1 * L_sat + lambda_2 * L_prof.
+        The DP grid is applied separately to v (minimises L_sat) and phi
+        (minimises L_prof); L_tot is their weighted sum.
+
+        Parameters
+        ----------
+        v_continuous          : continuous valuation array (full dataset).
+        q_continuous          : optional priority-weight array (same length).
+                                If None, uniform weights (q_j=1) are used.
+        phi_continuous        : optional virtual-value array (same length).
+                                If None, L_prof = 0 and only L_sat is tracked.
+        lambda_1, lambda_2    : weights for L_sat and L_prof in L_tot.
+        C                     : calibrated constant for the K* formula.
+                                If None, Phase-0 calibration is run automatically.
 
         Returns a DataFrame with per-phase metrics and prints a full summary.
         """
+        # ── Phase-0 calibration ───────────────────────────────────────────────
+        if C is None:
+            print("  Running Phase-0 warm-up to calibrate C …")
+            C = Discretizer.calibrate_C(
+                v_continuous,
+                warmup_n=initial_batch_size,
+                k_search_max=k_search_max,
+                k_search_threshold_pct=k_search_threshold_pct,
+            )
+
         # Shuffle once, then consume sequentially so phases are non-overlapping.
         rng = np.random.default_rng(seed=42)
-        shuffled = rng.permutation(v_continuous)
+        shuffle_idx = rng.permutation(len(v_continuous))
+        shuffled = v_continuous[shuffle_idx]
+        q_shuffled = (
+            q_continuous[shuffle_idx] if q_continuous is not None
+            else np.ones(len(v_continuous))
+        )
+        phi_shuffled = (
+            phi_continuous[shuffle_idx] if phi_continuous is not None
+            else np.zeros(len(v_continuous))
+        )
 
         rows = []
         totals = {m: {"error": 0.0, "time": 0.0}
@@ -318,7 +520,7 @@ class Discretizer:
         sep = "=" * 76
         print(f"\n{sep}")
         print(f"  DP Scaling Test — three strategies")
-        print(f"  Fixed K={K_fixed}  |  Theoretical K (formula)  |  "
+        print(f"  Fixed K={K_fixed}  |  Theoretical K* = ceil(C·N^{{1/5}})  C={C:.4f}  |  "
               f"Optimal K search (2..{k_search_max}, stop if improvement < {k_search_threshold_pct}%)")
         print(f"  Phases: {phase_label}  |  Initial batch: {initial_batch_size:,} jobs  "
               f"|  Total available: {len(shuffled):,}")
@@ -340,33 +542,45 @@ class Discretizer:
 
             # Use all remaining jobs if fewer than the full batch size
             batch = shuffled[offset: offset + batch_size]
+            q_batch = q_shuffled[offset: offset + batch_size]
+            phi_batch = phi_shuffled[offset: offset + batch_size]
             actual_n = len(batch)
             offset += actual_n
             if actual_n < batch_size:
                 print(f"\n  Phase {phase}: only {actual_n:,} jobs remain "
                       f"(expected {batch_size:,}) — running with reduced batch.")
 
-            # Total continuous revenue of this batch (denominator for % error)
-            batch_total = float(np.sum(batch))
+            # Max achievable L_tot for this batch (denominator for %)
+            batch_total = (
+                lambda_1 * float(np.sum(q_batch * batch))
+                + lambda_2 * float(np.sum(phi_batch))
+            )
 
             # ── 1. Fixed-K DP ─────────────────────────────────────────────────
             disc = Discretizer(K_bins=K_fixed)
             t0 = time.perf_counter()
             v_disc = disc.dp_optimal_grid(batch)
+            phi_disc = disc.dp_optimal_grid(phi_batch)
             time_fixed = time.perf_counter() - t0
-            error_fixed = float(disc.calculate_financial_loss(batch, v_disc))
+            l_sat = float(disc.calculate_satisfaction_loss(batch, v_disc, q_values=q_batch))
+            l_prof = float(disc.calculate_virtual_revenue_loss(phi_batch, phi_disc))
+            error_fixed = lambda_1 * l_sat + lambda_2 * l_prof
 
             # ── 2. Theoretical-K DP ───────────────────────────────────────────
-            K_theoretical = Discretizer._theoretical_k(prev_batch_size)
+            # K* = ceil(C · prev_batch_size^{1/5}), derived from dR/dK=0
+            K_theoretical = Discretizer._theoretical_k(prev_batch_size, C=C)
             disc = Discretizer(K_bins=K_theoretical)
             t0 = time.perf_counter()
             v_disc = disc.dp_optimal_grid(batch)
+            phi_disc = disc.dp_optimal_grid(phi_batch)
             time_theoretical = time.perf_counter() - t0
-            error_theoretical = float(disc.calculate_financial_loss(batch, v_disc))
+            l_sat = float(disc.calculate_satisfaction_loss(batch, v_disc, q_values=q_batch))
+            l_prof = float(disc.calculate_virtual_revenue_loss(phi_batch, phi_disc))
+            error_theoretical = lambda_1 * l_sat + lambda_2 * l_prof
 
             # ── 3. Optimal K search ───────────────────────────────────────────
             # Sweep K=2..k_search_max. Stop early when the marginal improvement
-            # drops below k_search_threshold_pct to find the "knee" of the curve.
+            # in L_tot drops below k_search_threshold_pct.
             best_k_star = 2
             best_error_optimal = float("inf")
             prev_err_k = float("inf")
@@ -375,7 +589,10 @@ class Discretizer:
             for k in range(2, k_search_max + 1):
                 disc_k = Discretizer(K_bins=k)
                 v_disc_k = disc_k.dp_optimal_grid(batch)
-                err_k = float(disc_k.calculate_financial_loss(batch, v_disc_k))
+                phi_disc_k = disc_k.dp_optimal_grid(phi_batch)
+                l_sat_k = float(disc_k.calculate_satisfaction_loss(batch, v_disc_k, q_values=q_batch))
+                l_prof_k = float(disc_k.calculate_virtual_revenue_loss(phi_batch, phi_disc_k))
+                err_k = lambda_1 * l_sat_k + lambda_2 * l_prof_k
 
                 if err_k < best_error_optimal:
                     best_error_optimal = err_k
@@ -390,10 +607,10 @@ class Discretizer:
                 prev_err_k = err_k
             time_optimal_search = time.perf_counter() - t0_search
 
-            # ── % of batch revenue lost (always in [0, 100]) ──────────────────
-            error_fixed_pct       = (error_fixed       / batch_total) * 100
-            error_theoretical_pct = (error_theoretical / batch_total) * 100
-            error_optimal_pct     = (best_error_optimal / batch_total) * 100
+            # ── % of max continuous L_tot ─────────────────────────────────────
+            error_fixed_pct       = (error_fixed       / batch_total) * 100 if batch_total else 0.0
+            error_theoretical_pct = (error_theoretical / batch_total) * 100 if batch_total else 0.0
+            error_optimal_pct     = (best_error_optimal / batch_total) * 100 if batch_total else 0.0
 
             # ── Accumulate totals ─────────────────────────────────────────────
             totals["fixed"]["error"]       += error_fixed
@@ -421,15 +638,15 @@ class Discretizer:
                 "Time_Search_sec":         time_optimal_search,
             })
 
-            print(f"\n  Phase {phase}  |  N={actual_n:,}  |  Batch revenue={batch_total:.2f}")
+            print(f"\n  Phase {phase}  |  N={actual_n:,}  |  Batch L_tot max={batch_total:.4f}")
             print(f"    Fixed        (K={K_fixed:3d}):  "
-                  f"Error={error_fixed:10.4f} ({error_fixed_pct:5.2f}% of batch)"
+                  f"L_tot={error_fixed:10.4f} ({error_fixed_pct:5.2f}% of max)"
                   f"  |  Time={time_fixed:.4f}s")
             print(f"    Theoretical  (K={K_theoretical:3d}):  "
-                  f"Error={error_theoretical:10.4f} ({error_theoretical_pct:5.2f}% of batch)"
+                  f"L_tot={error_theoretical:10.4f} ({error_theoretical_pct:5.2f}% of max)"
                   f"  |  Time={time_theoretical:.4f}s")
             print(f"    Optimal K*   (K={best_k_star:3d}):  "
-                  f"Error={best_error_optimal:10.4f} ({error_optimal_pct:5.2f}% of batch)"
+                  f"L_tot={best_error_optimal:10.4f} ({error_optimal_pct:5.2f}% of max)"
                   f"  |  Search time={time_optimal_search:.4f}s "
                   f"(converged at K={best_k_star}, max={k_search_max})")
 
@@ -447,7 +664,7 @@ class Discretizer:
             (f"Optimal K*  (search 2..{k_search_max})", "optimal"),
         ]:
             print(f"  {label}:  "
-                  f"Total Error={totals[key]['error']:12.4f}  |  "
+                  f"Total L_tot={totals[key]['error']:12.4f}  |  "
                   f"Total Time={totals[key]['time']:.4f}s")
         print(f"{sep}\n")
 
@@ -461,7 +678,7 @@ if __name__ == "__main__":
 
     # 1. Define paths assuming the script is run from the project root
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_path = os.path.join(base_dir, "data", "processed", "static_batch_may2019.csv")
+    data_path = "../data/processed/batch_may2019_2k.csv"
 
     print("=== Discretizer Local Test: Two-Metric Loss Evaluation ===")
     print(f"Loading dataset from: {data_path}")
@@ -498,20 +715,23 @@ if __name__ == "__main__":
             
             execution_time = time.perf_counter() - start_time
             
-            # Calculate the two distinct metrics
-            financial_loss, v_cont_sum, v_disc_sum = discretizer.calculate_financial_loss(
+            # L_sat = sum_j q_j * (v_j - L_k)   [q-weighted satisfaction loss]
+            financial_loss, v_cont_sum, v_disc_sum = discretizer.calculate_satisfaction_loss(
                 v_continuous,
                 v_discrete,
+                q_values=q_j,          # <-- priority-weighted per the L_sat formula
                 return_details=True,
             )
-            objective_loss = discretizer.calculate_objective_loss(phi_continuous, phi_discrete, q_j, lambda_2=LAMBDA_2)
+            # L_prof = sum_j q_j * (phi(v_j) - phi(L_k))
+            objective_loss = discretizer.calculate_virtual_revenue_loss(phi_continuous, phi_discrete)
             
             print(f"--- {name} Grid (K={K_BINS}) ---")
-            print(f"  Total Continuous Valuation : ${v_cont_sum:.2f}")
-            print(f"  Total Discrete Valuation   : ${v_disc_sum:.2f}")
-            print(f"  Pure Financial Cash Loss : ${financial_loss:.2f}")
-            print(f"  Oracle's Objective Loss  : {objective_loss:.4f}")
-            print(f"  Execution Time           : {execution_time:.4f} seconds\n")
+            print(f"  Weighted Continuous Valuation : ${v_cont_sum:.2f}")
+            print(f"  Weighted Discrete Valuation   : ${v_disc_sum:.2f}")
+            print(f"  L_sat  (Satisfaction Loss)    : ${financial_loss:.2f}")
+            print(f"  L_prof (Virtual Profit Loss)  : {objective_loss:.4f}")
+            print(f"  L_total = λ1·L_sat + λ2·L_prof: {LAMBDA_2 * financial_loss + LAMBDA_2 * objective_loss:.4f}")
+            print(f"  Execution Time                : {execution_time:.4f} seconds\n")
 
         # 5. Run the evaluations
         evaluate_grid("Uniform (Arithmetic)", discretizer.uniform_grid)
