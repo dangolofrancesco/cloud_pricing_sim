@@ -66,17 +66,49 @@ def _dominates_max(a: np.ndarray, b: np.ndarray) -> bool:
 def _extract_objective_matrix(
     solutions: List[Dict],
     keys: List[str] = None,
+    allow_partial: bool = False,
 ) -> np.ndarray:
     """
     Return (N, k) matrix of objective values from a list of solution dicts.
-    Reads from 'normalized_objectives'.
+    Reads from 'normalized_objectives' (preferred) or legacy 'normalized'.
     """
     if keys is None:
         keys = OBJ_KEYS
     rows = []
+    skipped = 0
     for sol in solutions:
-        norm = sol["normalized_objectives"]
+        if not isinstance(sol, dict):
+            if allow_partial:
+                skipped += 1
+                continue
+            raise TypeError("Each solution must be a dict-like record.")
+
+        norm = sol.get("normalized_objectives")
+        if norm is None:
+            norm = sol.get("normalized")
+        if norm is None:
+            if allow_partial:
+                skipped += 1
+                continue
+            raise KeyError(
+                "Each solution must include 'normalized_objectives' "
+                "(or legacy key 'normalized')."
+            )
         rows.append([norm[k] for k in keys])
+
+    if skipped > 0:
+        warnings.warn(
+            f"Skipped {skipped} point(s) missing normalized objectives.",
+            RuntimeWarning,
+        )
+
+    if len(rows) == 0:
+        if allow_partial:
+            return np.empty((0, len(keys)))
+        raise KeyError(
+            "No valid points found with 'normalized_objectives' (or legacy 'normalized')."
+        )
+
     return np.array(rows)
 
 
@@ -120,7 +152,7 @@ def _pool_matrix(
     pareto_idx = _compute_pareto_indices_max(sol_matrix)
 
     if dominated_pool:
-        dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+        dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
         full_matrix = np.vstack([sol_matrix, dom_matrix])
         # Shift pareto indices — they index into sol_matrix, same as full_matrix[:len(sol_matrix)]
         return full_matrix, pareto_idx, len(sol_matrix)
@@ -153,7 +185,7 @@ class ParetoFrontVisualizer:
         self.figsize_3d = figsize_3d
         self.dpi = dpi
 
-        # FIX-6: reference points stored in NORMALIZED space [0,1]^3
+        # Reference points stored in NORMALIZED space [0,1]^3
         # so they plot correctly on normalized axes.
         self._z_ideal_norm = None   # (1, 1, 1) in normalized space
         self._z_nadir_norm = None   # (0, 0, 0) in normalized space
@@ -226,7 +258,7 @@ class ParetoFrontVisualizer:
         # projection coordinates. dominated_pool points are always plotted
         # as background and do not affect frontier detection.
         if dominated_pool:
-            dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+            dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
             pool_x = np.concatenate([
                 xy_matrix[dominated_mask_sol, 0],
                 dom_matrix[:, idx_x],
@@ -414,6 +446,109 @@ class ParetoFrontVisualizer:
         if save_path:
             fig.savefig(save_path, dpi=self.dpi, bbox_inches="tight", facecolor="white")
         return fig
+    
+
+    ########## CORRECT VERSION #############
+    def plot_2d_pareto_with_dominated(
+            self, 
+            solutions: List[Dict], 
+            dominated_pool: List[Dict], 
+            method_name: str, 
+            method_color: str, 
+            title: str):
+        """
+        Plot 2D pairwise projections with dominated pool background.
+        
+        This is the CORRECTED version that fixes the "vertical lines" bug by:
+        1. Explicit sorting before line plotting
+        2. Separate scatter (points) and plot (line) calls
+        3. Proper zorder layering
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(title, fontsize=14, fontweight='bold')
+        
+        projections = [
+            ('V_prof', 'V_sat', 'Provider Profit', 'Customer Satisfaction'),
+            ('V_prof', 'V_sus', 'Provider Profit', 'Sustainability'),
+            ('V_sat', 'V_sus', 'Customer Satisfaction', 'Sustainability')
+        ]
+        
+        for idx, (obj_x, obj_y, label_x, label_y) in enumerate(projections):
+            ax = axes[idx]
+            
+            # ===== LAYER 1: DOMINATED POOL (GRAY BACKGROUND) =====
+            dom_points = []
+            for sol in dominated_pool:
+                norm = sol.get('normalized_objectives', sol.get('normalized', {}))
+                dom_points.append([norm.get(obj_x, 0), norm.get(obj_y, 0)])
+            dom_points = np.array(dom_points)
+            
+            if len(dom_points) > 0:
+                ax.scatter(dom_points[:, 0], dom_points[:, 1], 
+                        c=COLORS['dominated'], s=15, alpha=0.25, zorder=1,
+                        label='Dominated solutions')
+            
+            # ===== LAYER 2: PARETO FRONT =====
+            pareto_points = []
+            for sol in solutions:
+                norm = sol.get('normalized_objectives', sol.get('normalized', {}))
+                pareto_points.append([norm.get(obj_x, 0), norm.get(obj_y, 0)])
+            pareto_points = np.array(pareto_points)
+            
+            # CRITICAL FIX: Sort by X-axis before plotting line
+            # This prevents the "vertical lines" artifact from unsorted points
+            sorted_idx = np.argsort(pareto_points[:, 0])
+            pareto_sorted = pareto_points[sorted_idx]
+            
+            # Plot connecting line FIRST (lower zorder)
+            ax.plot(pareto_sorted[:, 0], pareto_sorted[:, 1], 
+                color=method_color, alpha=0.4, linewidth=2, zorder=2,
+                linestyle='-')  # Explicit linestyle
+            
+            # Plot scatter points SECOND (higher zorder, on top of line)
+            ax.scatter(pareto_points[:, 0], pareto_points[:, 1],
+                    c=method_color, s=60, alpha=0.8, zorder=3,
+                    edgecolors='white', linewidths=0.5,
+                    label=f'Pareto Front ({method_name})')
+            
+            # ===== LAYER 3: REFERENCE POINTS =====
+            # Show Utopian and Nadir ONLY on first plot (Profit vs Satisfaction)
+            # to avoid cluttering all three panels
+            if idx == 0:  # Changed from checking obj_x/obj_y to checking index
+                # Utopian point (1,1,1) - best in all objectives
+                ax.scatter(1.0, 1.0, marker='*', s=300, c=COLORS['utopian'],
+                        edgecolors='black', linewidths=1.5, zorder=5,
+                        label='z^ideal (1,1,1)')
+                # Nadir point (0,0,0) - worst in all objectives
+                ax.scatter(0.0, 0.0, marker='D', s=120, c=COLORS['nadir'],
+                        edgecolors='black', linewidths=1.5, zorder=5,
+                        label='z^nadir (0,0,0)')
+            
+            # ===== FORMATTING =====
+            ax.set_xlabel(label_x, fontsize=11, fontweight='bold')
+            ax.set_ylabel(label_y, fontsize=11, fontweight='bold')
+            ax.set_title(f'{label_x} vs {label_y}', fontsize=12)
+            ax.grid(True, alpha=0.3, linewidth=0.5, linestyle='--')
+            
+            # Legend positioning: avoid covering data
+            # Use different locations for different panels
+            legend_locs = ['upper left', 'upper right', 'lower left']
+            ax.legend(fontsize=9, loc=legend_locs[idx], framealpha=0.95,
+                    edgecolor='gray', fancybox=True)
+            
+            # Point count annotation in consistent location
+            ax.text(0.02, 0.98, f'n={len(pareto_points)}', 
+                transform=ax.transAxes, fontsize=9, 
+                verticalalignment='top', horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='wheat', 
+                            alpha=0.7, edgecolor='gray'))
+            
+            # Set axis limits with small padding
+            ax.set_xlim(-0.05, 1.05)
+            ax.set_ylim(-0.05, 1.05)
+        
+        plt.tight_layout()
+        return fig 
 
     # ══════════════════════════════════════════════════════════════════════════
     # 3-D  single plot
@@ -435,21 +570,18 @@ class ParetoFrontVisualizer:
     ):
         """
         3D Pareto surface with optional dominated background cloud.
-
-        Parameters
-        ----------
-        dominated_pool : list[dict] | None
-            Extra solutions used only for the gray 3D scatter.
         """
         keys = OBJ_KEYS
         sol_matrix = _extract_objective_matrix(solutions, keys)
+        
+        # Calcolo Pareto corretto per il 3D
         pareto_idx = _compute_pareto_indices_max(sol_matrix)
         dominated_mask_sol = np.ones(len(solutions), dtype=bool)
         dominated_mask_sol[pareto_idx] = False
 
-        # FIX-5: build full dominated cloud
+        # Costruzione cloud dominata
         if dominated_pool:
-            dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+            dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
             dom_cloud = np.vstack([sol_matrix[dominated_mask_sol], dom_matrix])
         else:
             dom_cloud = sol_matrix[dominated_mask_sol]
@@ -495,22 +627,25 @@ class ParetoFrontVisualizer:
             except Exception:
                 pass
 
-        # Reference points (FIX-6: normalized coordinates)
+        # Reference points
         if show_reference_points and self._has_ref:
             ax.scatter(
                 *self._z_ideal_norm, marker="*", s=300, c=COLORS["utopian"],
-                zorder=7, label=r"$z^{\mathrm{ideal}}$",
+                zorder=7, label=r"$\mathbf{z}^{\mathrm{ideal}}$",
                 edgecolors="white", linewidths=0.5,
             )
             ax.scatter(
                 *self._z_nadir_norm, marker="D", s=120, c=COLORS["nadir"],
-                zorder=7, label=r"$z^{\mathrm{nadir}}$",
+                zorder=7, label=r"$\mathbf{z}^{\mathrm{nadir}}$",
                 edgecolors="white", linewidths=0.5,
             )
 
-        ax.set_xlabel(OBJECTIVE_LABELS.get("V_sat", "V_sat"), fontsize=9, labelpad=9)
-        ax.set_ylabel(OBJECTIVE_LABELS.get("V_prof", "V_prof"), fontsize=9, labelpad=9)
-        ax.set_zlabel(OBJECTIVE_LABELS.get("V_sus", "V_sus"), fontsize=9, labelpad=9)
+        # --- MODIFICA QUI: Etichette dinamiche basate su OBJ_KEYS ---
+        ax.set_xlabel(OBJECTIVE_LABELS.get(keys[0], keys[0]), fontsize=9, labelpad=9)
+        ax.set_ylabel(OBJECTIVE_LABELS.get(keys[1], keys[1]), fontsize=9, labelpad=9)
+        ax.set_zlabel(OBJECTIVE_LABELS.get(keys[2], keys[2]), fontsize=9, labelpad=9)
+        # -----------------------------------------------------------
+
         ax.legend(fontsize=8, loc="upper left", framealpha=0.9)
 
         if title is None:
@@ -636,7 +771,7 @@ class ParetoFrontVisualizer:
 
         # Draw dominated background once (union of all pools)
         if dominated_pool:
-            dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+            dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
             ax.scatter(
                 dom_matrix[:, idx_x], dom_matrix[:, idx_y],
                 c=COLORS["dominated"], s=18, alpha=0.35, zorder=1,
@@ -705,7 +840,7 @@ class ParetoFrontVisualizer:
         keys = OBJ_KEYS
 
         if dominated_pool:
-            dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+            dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
             ax.scatter(
                 dom_matrix[:, 0], dom_matrix[:, 1], dom_matrix[:, 2],
                 c=COLORS["dominated"], s=12, alpha=0.22,
@@ -803,7 +938,7 @@ class ParetoFrontVisualizer:
 
         # Dominated background
         if dominated_pool:
-            dom_matrix = _extract_objective_matrix(dominated_pool, keys)
+            dom_matrix = _extract_objective_matrix(dominated_pool, keys, allow_partial=True)
             ax.scatter(
                 dom_matrix[:, idx_x], dom_matrix[:, idx_y],
                 c=COLORS["dominated"], s=18, alpha=0.35, zorder=1,

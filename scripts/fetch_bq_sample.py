@@ -20,7 +20,7 @@ query_jobs = """
     FROM `google.com:google-cluster-data.clusterdata_2019_a.instance_events`
     WHERE type = 0 
     AND RAND() < 0.05
-    LIMIT 500
+    LIMIT 30000
 """
 jobs_df = client.query(query_jobs).to_dataframe()
 sampled_job_ids = jobs_df['collection_id'].tolist()

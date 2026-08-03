@@ -36,7 +36,7 @@ class DataGenerator:
         print("Loading instance events...")
         events_df = pd.read_csv(
             events_path,
-            usecols=['collection_id', 'priority', 'scheduling_class', 'resource_request_cpus', 'resource_request_ram', 'machine_id']
+            usecols=['collection_id', 'priority', 'scheduling_class', 'resource_request_cpus', 'resource_request_ram']
         )
 
         events_df['collection_id'] = pd.to_numeric(events_df['collection_id'], errors='coerce').astype('Int64')
@@ -47,8 +47,7 @@ class DataGenerator:
             'scheduling_class': 'first',     
             'resource_request_cpus': 'sum',  
             'resource_request_ram': 'sum',
-            'machine_id': 'count' # We use this column just to count the number of Tasks
-        }).rename(columns={'machine_id': 'task_count'}).reset_index()
+        })
         
         if sample_frac < 1.0:
             events_agg = events_agg.sample(frac=sample_frac, random_state=42)
@@ -83,13 +82,19 @@ class DataGenerator:
             'resource_request_ram': 'A_ram',
             'duration_hours': 'D (hours)'
         })
+
+        # Map raw priorities to 5 standard tiers based on Google Trace documentation
+        bins = [-1, 99, 115, 119, 350, float('inf')]
+        labels = [1, 2, 3, 4, 5]
+        # 1: Best Effort, 2: Batch, 3: Mid-tier, 4: Production, 5: Latency-Critical
+        merged_df['q_j'] = pd.cut(merged_df['q_j'], bins=bins, labels=labels).astype(float)
         
         merged_df['job_datetime'] = pd.to_datetime('2019-05-01') + pd.to_timedelta(merged_df['start_time'], unit='us')
         
         merged_df = merged_df.dropna(subset=['A_cpu', 'q_j', 'D (hours)'])
         
         # Clean up temporary columns
-        merged_df = merged_df.drop(columns=['task_count', 'average_usage_cpus', 'average_usage_memory', 'end_time'])
+        merged_df = merged_df.drop(columns=['average_usage_cpus', 'average_usage_memory', 'end_time'])
         
         self.raw_jobs = merged_df
         print(f"Successfully loaded and merged {len(self.raw_jobs)} jobs.")

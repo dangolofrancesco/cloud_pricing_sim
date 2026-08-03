@@ -1,17 +1,17 @@
 """
 discretizer_simulator.py
 ========================
-Evaluates Uniform, Geometric, and DP Optimal discretization baselines
-by measuring their loss through the StaticCloudSimulator environment.
+Evaluates Uniform, Geometric, and DP Grid discretization baselines
+by measuring their Grid Loss through the StaticCloudSimulator environment.
 
-Allocation Policy — Fluid Volume LP (OPT_LP)
----------------------------------------------
-All jobs are known at t=0 (static/offline setting).  The oracle solves a
+Allocation Policy — Fluid Volume LP (Fluid Upper Bound)
+--------------------------------------------------------
+All jobs are known at t=0 (static/offline setting). The oracle solves a
 Linear Program over fractional decisions x_j ∈ [0, 1]:
 
     max   ∑_j r_j · x_j
     s.t.  ∑_j x_j · resource_j · duration_j  ≤  C_max · T   (Fluid Volume)
-          x_j = 0   if phi_j ≤ 0                              (Individual Rationality)
+          x_j = 0   if r_j < 0                                (Scalarized Reward Filter)
           x_j ∈ [0, 1]
 
 where the scalarized per-job reward is:
@@ -23,22 +23,22 @@ with equal lambdas lambda1 = lambda2 = lambda3 = 1/3.
 
 The Fluid Volume constraint replaces instantaneous capacity tracking:
 instead of checking point-in-time usage it bounds the total resource
-volume (core·hours) consumed over the horizon T, matching the OPT_LP
-benchmark used in DLENT regret bounds.
+volume (core·hours) consumed over the horizon T, matching the
+Fluid Upper Bound benchmark used in DLENT regret bounds.
 
-Loss Metric (Global Objective Space)
---------------------------------------
+Loss Metric (Grid Loss in Objective Space)
+-------------------------------------------
 Two LP solves per baseline:
   - Continuous  x*_cont  →  R_cont = ∑_j x*_cont_j · r_cont_j
   - Discrete    x*_disc  →  R_disc = ∑_j x*_disc_j · r_disc_j
 
-    Global Objective Loss  =  R_cont − R_disc
+    Grid Loss  =  R_cont − R_disc
 
 Three discretization baselines (K bins each)
 --------------------------------------------
   1. Uniform   — arithmetic grid over [phi_min, phi_max]
   2. Geometric — geometric (log-spaced) grid
-  3. DP Optimal — dynamic-programming grid minimising revenue loss
+  3. DP Grid — dynamic-programming grid minimising revenue loss
 
 Both v (valuation) and phi (virtual value) are discretized independently.
 """
@@ -61,9 +61,29 @@ class Discretizer:
     def __init__(self, K_bins: int):
         self.K = K_bins
 
-    def _enforce_ir(self, phi_array: np.ndarray) -> np.ndarray:
-        """Return only the individually-rational values (phi > 0)."""
-        return phi_array[phi_array > 0]
+    @staticmethod
+    def enforce_positive_reward(
+        df: pd.DataFrame,
+        v_col: str = "v_rate",
+        phi_col: str = "phi_rate",
+        lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+    ) -> pd.DataFrame:
+        """Return only jobs whose scalarized reward r_j >= 0.
+        
+        Jobs with r_j < 0 are Grid-Induced Rejections (GIR), NOT
+        Individual Rationality violations. A job may have negative profit
+        (Φ < 0) but still be accepted if it delivers high green energy usage
+        and priority. The scalarized reward is the proper filter:
+
+        r_j = λ₁·q_j·L_j + λ₂·(Φ(L_j) − C_elec_j) − λ₃·C_carbon_j
+        """
+        l1, l2, l3 = lambdas
+        r = (
+            l1 * df["priority"] * df[v_col]
+            + l2 * (df[phi_col] - df["c_elec"])
+            - l3 * df["c_carbon"]
+        )
+        return df[r > 0]
 
     def _map_to_bins(
         self,
@@ -81,9 +101,10 @@ class Discretizer:
 
     # ------------------------------------------------------------------
     # Public grid methods — each accepts the *full* array (including
-    # phi <= 0) and returns a discretized array of the *same length*,
-    # with non-IR values left at their original (negative) values so
-    # the simulator's IR filter still works correctly.
+    # non-positive values) and returns a discretized array of the same
+    # length, leaving non-positive values unchanged so downstream reward-
+    # based GIR (Grid-Induced Rejection) filtering can still reject toxic
+    # jobs correctly.
     # ------------------------------------------------------------------
 
     def uniform_grid(self, values: np.ndarray) -> np.ndarray:
@@ -123,7 +144,7 @@ class Discretizer:
 
     def dp_optimal_grid(self, values: np.ndarray) -> np.ndarray:
         """
-        Baseline 3 — DP Optimal Grid.
+        Baseline 3 — DP Grid Grid.
         Finds the K bin boundaries that minimise revenue loss for this dataset.
         Complexity: O(K * N^2) with numpy vectorisation.
         Non-positive values are passed through unchanged.
@@ -192,7 +213,8 @@ class Discretizer:
         TRAIN (Phase M-1): Run the DP algorithm on historical data and return
         exactly K bin lower-bound boundary points.
 
-        Only IR-valid values (> 0) participate in the DP; the returned
+        Only scalarized-reward-valid values (r_j >= 0) participate in the DP;
+        the returned boundaries may not cover the full range of continuous
         boundaries are therefore always positive, which guarantees that
         apply_boundaries will never accidentally map a positive test value
         to 0 due to a missing lower bin.
@@ -200,14 +222,14 @@ class Discretizer:
         Parameters
         ----------
         train_data : 1-D array of continuous values from Phase M-1.
-                     May contain non-positive values (IR violations); these
-                     are filtered out before fitting.
+                     May contain non-positive values (Grid-Induced Rejections);
+                     these are filtered out before fitting.
 
         Returns
         -------
         boundaries : sorted array of at most K positive lower-bound values.
         """
-        # Filter to IR-valid training values only
+        # Filter to scalarized-reward-valid training values only (r_j >= 0)
         valid = train_data[train_data > 0]
         if len(valid) == 0:
             return np.array([0.0])
@@ -267,12 +289,12 @@ class Discretizer:
         -----
         * Positive test values below the lowest boundary are mapped to
           boundaries[0] (the smallest known positive price) — NOT to 0.
-          This avoids spurious IR violations caused purely by out-of-range
-          test values, which would be a data-leakage artefact, not a true
-          discretization error.
-        * Non-positive test values (IR violations in continuous space) are
-          passed through unchanged at their original value.  The LP oracle's
-          IR filter (phi > 0 bound) handles them correctly.
+          This avoids spurious Grid-Induced Rejections caused purely by
+          out-of-range test values, which would be a data-leakage artefact,
+          not a true discretization error.
+        * Non-positive test values (jobs with r_j < 0 in continuous space)
+          are passed through unchanged at their original value. The LP oracle's
+          reward-based GIR filter handles them correctly.
 
         Parameters
         ----------
@@ -438,18 +460,19 @@ class Discretizer:
 
 class StaticCloudSimulator:
     """
-    Static offline allocation oracle based on the Fluid Volume LP (OPT_LP).
+    Static offline allocation oracle based on the Fluid Volume LP
+    (Fluid Upper Bound).
 
-    All jobs are known at t=0.  The oracle solves:
+    All jobs are known at t=0. The oracle solves:
 
         max   ∑_j r_j · x_j
         s.t.  ∑_j x_j · resource_j · duration_j  ≤  C_max · T   (Fluid Volume)
-              x_j = 0  if phi_j ≤ 0                               (Individual Rationality)
+              x_j = 0  if r_j < 0                                 (Grid-Induced Rejection filter)
               x_j ∈ [0, 1]                                        (fractional relaxation)
 
     The Fluid Volume constraint bounds total resource-volume (unit·time) over
-    the full horizon T, rather than tracking instantaneous occupancy.  This is
-    the OPT_LP benchmark required for DLENT regret bounds.
+    the full horizon T, rather than tracking instantaneous occupancy. This is
+    the Fluid Upper Bound benchmark required for DLENT regret bounds.
 
     Per-job scalarized reward (weighted linear scalarization):
 
@@ -469,6 +492,7 @@ class StaticCloudSimulator:
         capacity,
         horizon: float,
         lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+        rho: float | None = None,
     ):
         # Accept either a scalar capacity (backwards-compatible) or a
         # dict with per-resource capacities, e.g. {'cpu': 230.0, 'ram':130.0}
@@ -483,7 +507,8 @@ class StaticCloudSimulator:
             cap = float(capacity)
             self.C_max = {'cpu': cap, 'ram': cap}
 
-        self.T = horizon
+        self.T   = horizon
+        self.rho = rho
         self.l1, self.l2, self.l3 = lambdas
 
     # ------------------------------------------------------------------
@@ -524,8 +549,11 @@ class StaticCloudSimulator:
         """
         Solve the Fluid Volume LP and return fractional decisions + rewards.
 
-        Individual Rationality is enforced by fixing x_j = 0 (upper bound 0)
-        for all jobs with phi_j ≤ 0, before the LP is even constructed.
+        Grid-Induced Rejection (GIR) filter follows the offline optimizer's
+        scalarized reward filter: jobs with strictly negative scalarized reward
+        (r_j < 0) are forced to x_j = 0 via variable bounds before solving.
+        This is NOT Individual Rationality — a job may lose money (Φ < 0) but
+        still be accepted if it uses 100% green energy and has high priority.
 
         Parameters
         ----------
@@ -570,13 +598,19 @@ class StaticCloudSimulator:
         volume_cpu = resource_cpu * duration
         volume_ram = resource_ram * duration
 
-        # Fluid Volume constraints (one per resource):  ∑_j x_j · vol_{r,j} ≤ C_max[r] · T
+        # Fluid Volume constraints (one per resource):  ∑_j x_j · vol_{r,j} ≤ budget[r]
+        # Adaptive mode (rho): budget = rho · Σ vol_{r,j}  (mirrors FluidLPOptimizer)
+        # Legacy mode:         budget = C_max[r] · T
         A_ub = np.vstack([volume_cpu.reshape(1, n), volume_ram.reshape(1, n)])
-        b_ub = np.array([self.C_max['cpu'] * self.T, self.C_max['ram'] * self.T])
+        if self.rho is not None:
+            b_ub = np.array([self.rho * volume_cpu.sum(), self.rho * volume_ram.sum()])
+        else:
+            b_ub = np.array([self.C_max['cpu'] * self.T, self.C_max['ram'] * self.T])
 
-        # Individual Rationality: x_j ∈ [0, 0] for phi_j ≤ 0
-        ir_valid = phi > 0
-        bounds = [(0.0, 1.0) if ir_valid[j] else (0.0, 0.0) for j in range(n)]
+        # Grid-Induced Rejection (GIR) filter (offline_optimizer parity):
+        # x_j ∈ [0, 0] for strictly negative scalarized rewards.
+        gir_valid = r_j >= 0
+        bounds = [(0.0, 1.0) if gir_valid[j] else (0.0, 0.0) for j in range(n)]
 
         # linprog minimises, so negate the reward vector
         res = linprog(-r_j, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
@@ -613,7 +647,7 @@ class StaticCloudSimulator:
         metrics    : dict of aggregate scalar metrics
         """
         if verbose:
-            print("  [Continuous] Solving Fluid LP with continuous (v, phi) …")
+            print("  [Theoretical Upper Bound] Solving Fluid LP with continuous (v, phi) …")
         x_cont, r_cont = self.run_allocation(df, v_cont_col, phi_cont_col)
 
         if verbose:
@@ -635,26 +669,52 @@ class StaticCloudSimulator:
         abs_loss   = total_cont - total_disc
         pct_loss   = (abs_loss / total_cont * 100) if total_cont > 0 else 0.0
 
-        # IR-downgrade: jobs where continuous assigned x>0 but discrete forced x=0
-        # (phi_disc ≤ 0 due to binning rounding a previously positive phi down)
-        ir_downgraded = int(np.sum((x_cont > 0) & (x_disc == 0)))
+        # Grid-Induced Rejections (GIR): jobs accepted in continuous but forced
+        # to zero in discrete. With reward-based filtering, this often happens
+        # when discretization pushes a job's scalarized reward from r_j >= 0 to r_j < 0.
+        gir_count = int(np.sum((x_cont > 0) & (x_disc == 0)))
 
         # Acceptance / rejection counts for quick interpretability
         accepted_cont = int(np.sum(x_cont > 0))
         accepted_disc = int(np.sum(x_disc > 0))
-        ir_rejected_cont = int(np.sum(df[phi_cont_col].values.astype(float) <= 0))
-        ir_rejected_disc = int(np.sum(df[phi_disc_col].values.astype(float) <= 0))
+        q = df["priority"].values.astype(float)
+        c_elec = df["c_elec"].values.astype(float)
+        c_carbon = df["c_carbon"].values.astype(float)
+        r_cont_coeff = self._reward_vector(
+            df[v_cont_col].values.astype(float),
+            df[phi_cont_col].values.astype(float),
+            q,
+            c_elec,
+            c_carbon,
+        )
+        r_disc_coeff = self._reward_vector(
+            df[v_disc_col].values.astype(float),
+            df[phi_disc_col].values.astype(float),
+            q,
+            c_elec,
+            c_carbon,
+        )
+        gir_rejected_cont = int(np.sum(r_cont_coeff < 0))
+        gir_rejected_disc = int(np.sum(r_disc_coeff < 0))
 
         metrics = {
-            "Total Continuous Reward": total_cont,
-            "Total Discrete Reward":   total_disc,
-            "Absolute Global Loss":    abs_loss,
-            "Percentage Loss (%)":     pct_loss,
+            "Fluid Upper Bound Reward":       total_cont,
+            "Total Discrete Reward":          total_disc,
+            "Absolute Grid Loss":             abs_loss,
+            "Percentage Loss (%)":            pct_loss,
+            "Accepted Jobs (Fluid Upper Bound)": accepted_cont,
+            "Accepted Jobs (Discrete)":          accepted_disc,
+            "GIR Rejected Jobs (Fluid Upper Bound)": gir_rejected_cont,
+            "GIR Rejected Jobs (Discrete)":          gir_rejected_disc,
+            "Grid-Induced Rejections (GIR)":         gir_count,
+            # Legacy aliases (backward compatibility)
+            "Total Continuous Reward":    total_cont,
             "Accepted Jobs (Continuous)": accepted_cont,
-            "Accepted Jobs (Discrete)":   accepted_disc,
-            "IR Rejected Jobs (Continuous)": ir_rejected_cont,
-            "IR Rejected Jobs (Discrete)":   ir_rejected_disc,
-            "IR Downgrades":           ir_downgraded,
+            "IR Rejected Jobs (Theoretical Upper Bound)": gir_rejected_cont,
+            "IR Rejected Jobs (Discrete)":                gir_rejected_disc,
+            "IR Downgrades":              gir_count,
+            "Theoretical Upper Bound Reward": total_cont,
+            "IR Rejected Jobs (Continuous)":  gir_rejected_cont,
         }
 
         return results_df, metrics
@@ -666,7 +726,7 @@ class StaticCloudSimulator:
 
 class SimulatorDiscretizer:
     """
-    Evaluates Uniform, Geometric, and DP Optimal discretization baselines
+    Evaluates Uniform, Geometric, and DP Grid discretization baselines
     by running the StaticCloudSimulator (Fluid LP) and measuring the
     Global Objective Loss.
 
@@ -674,28 +734,34 @@ class SimulatorDiscretizer:
     ----------
     K_bins   : number of discrete price levels.
     capacity : instantaneous cluster capacity C_max (resource units).
+               Ignored when rho is set.
     horizon  : time horizon T (same unit as df["duration"]).
-               The Fluid Volume budget is  C_max * T.
+               Ignored when rho is set.
     lambdas  : (lambda1, lambda2, lambda3) for the scalarized reward.
                Defaults to equal weighting (1/3, 1/3, 1/3).
+    rho      : load factor for adaptive fluid budget (default 0.6).
+               When set, budget[r] = rho · Σ_j A_{r,j} · D_j  (mirrors
+               FluidLPOptimizer), overriding the fixed C_max · T budget.
+               Set to None to fall back to the legacy C_max · T mode.
     """
 
     METHODS: dict[str, str] = {
         "Uniform":    "uniform_grid",
         "Geometric":  "geometric_grid",
-        "DP Optimal": "dp_optimal_grid",
+        "DP Grid": "dp_optimal_grid",
     }
 
     def __init__(
         self,
         K_bins: int,
-        capacity: float,
-        horizon: float,
+        capacity: float = 0.0,
+        horizon: float = 1.0,
         lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+        rho: float | None = 0.6,
     ):
         self.K         = K_bins
         self.disc      = Discretizer(K_bins)
-        self.simulator = StaticCloudSimulator(capacity, horizon, lambdas)
+        self.simulator = StaticCloudSimulator(capacity, horizon, lambdas, rho=rho)
 
     # ------------------------------------------------------------------
     # Core evaluation
@@ -704,7 +770,7 @@ class SimulatorDiscretizer:
     def _build_sim_df(
         self,
         df: pd.DataFrame,
-        method_name: Literal["Uniform", "Geometric", "DP Optimal"],
+        method_name: Literal["Uniform", "Geometric", "DP Grid"],
         v_col:   str = "v",
         phi_col: str = "phi_v",
     ) -> pd.DataFrame:
@@ -728,7 +794,7 @@ class SimulatorDiscretizer:
     def evaluate_method(
         self,
         df: pd.DataFrame,
-        method_name: Literal["Uniform", "Geometric", "DP Optimal"],
+        method_name: Literal["Uniform", "Geometric", "DP Grid"],
         v_col:   str = "v",
         phi_col: str = "phi_v",
         verbose: bool = True,
@@ -801,7 +867,11 @@ class SimulatorDiscretizer:
         if verbose:
             sep = "=" * 78
             print(f"\n{sep}")
-            print(f"  COMPARISON SUMMARY  (K={self.K}, C_max={self.simulator.C_max})")
+            if self.simulator.rho is not None:
+                budget_str = f"rho={self.simulator.rho}"
+            else:
+                budget_str = f"C_max={self.simulator.C_max}"
+            print(f"  COMPARISON SUMMARY  (K={self.K}, {budget_str})")
             print(f"{sep}")
             print(summary_df.to_string())
             print(f"{sep}\n")
@@ -815,7 +885,7 @@ class SimulatorDiscretizer:
     def sweep_k(
         self,
         df: pd.DataFrame,
-        method_name: Literal["Uniform", "Geometric", "DP Optimal"],
+        method_name: Literal["Uniform", "Geometric", "DP Grid"],
         k_values: list[int],
         v_col:   str = "v",
         phi_col: str = "phi_v",
@@ -838,6 +908,7 @@ class SimulatorDiscretizer:
                 capacity=self.simulator.C_max,
                 horizon=self.simulator.T,
                 lambdas=(self.simulator.l1, self.simulator.l2, self.simulator.l3),
+                rho=self.simulator.rho,
             )
             _, metrics = sd.evaluate_method(
                 df, method_name, v_col, phi_col, verbose=False
@@ -848,7 +919,7 @@ class SimulatorDiscretizer:
             if verbose:
                 print(
                     f"  {method_name:12s}  K={k:3d} → "
-                    f"Loss={metrics['Absolute Global Loss']:10.4f}  "
+                    f"Loss={metrics['Absolute Grid Loss']:10.4f}  "
                     f"({pct:5.2f}%)"
                 )
             # If early-stop threshold supplied, compute marginal improvement
@@ -901,17 +972,17 @@ class SimulatorDiscretizer:
         Phase M  (M = 1, 2, …):
           • Draws the next ``batch_size`` jobs (batch doubles every phase).
           • Evaluates three DP strategies using boundaries trained on Phase M-1:
-              1. Fixed K  (K = K_fixed, user-specified ceiling)
-              2. Theoretical K*  (K_m = ⌈C · N^{1/5}⌉, where N is Phase M-1 batch size)
-              3. Optimal K search  (sweeps K = 2..k_search_max on Phase M-1
-                                    data; picks argmin loss on Phase M-1 test
-                                    split; always ≤ K*)
+              1. Static Baseline Grid  (e.g., K = K_fixed)
+              2. Theoretical K Bound   (K_m = ⌈C · N^{1/5}⌉, where N is Phase M-1 batch size)
+              3. Heuristic DP Grid     (sweeps K = 2..k_search_max on Phase M-1
+                                        data; picks argmin loss on Phase M-1 test
+                                        split; converges when marginal improvement < 1%)
           • For each strategy, ``get_dp_boundaries`` is called on Phase M-1
             data; ``apply_boundaries`` maps Phase M (unseen) data to those
-            boundaries.  The resulting discrete arrays are fed into the Fluid
-            LP oracle to compute Global Objective Loss vs. the continuous LP.
-          • Reports per-phase: K chosen, Global Loss (absolute + %), IR
-            downgrades, accepted jobs, and wall-clock search time.
+            boundaries. The resulting discrete arrays are fed into the Fluid
+            LP oracle to compute Grid Loss vs. the Fluid Upper Bound.
+          • Reports per-phase: K chosen, Grid Loss (absolute + %), Grid-Induced
+            Rejections (GIR), accepted jobs, and wall-clock search time.
 
         No data from Phase M is ever used to fit boundaries evaluated on
         Phase M — no leakage in either direction.
@@ -922,8 +993,8 @@ class SimulatorDiscretizer:
         v_col, phi_col          : column names for valuation and virtual value.
         initial_batch_size      : Phase-0 / Phase-1 batch size (doubles each phase).
         n_phases                : cap on phases (None = run until data exhausted).
-        K_fixed                 : fixed-K baseline ceiling.
-        k_search_max            : upper limit for the optimal-K sweep.
+        K_fixed                 : K for the Static Baseline Grid.
+        k_search_max            : upper limit for the Heuristic DP Grid sweep.
         k_search_threshold_pct  : early-stop: stop sweep when marginal loss
                                   improvement < this % (default 1 %).
         C                       : pre-calibrated constant for _theoretical_k.
@@ -935,11 +1006,11 @@ class SimulatorDiscretizer:
         -------
         pd.DataFrame with one row per phase and columns:
             Phase, Batch_Size,
-            K_Fixed,       Loss_Fixed (abs + %),   IR_Down_Fixed,
-            K_Theo,        Loss_Theo  (abs + %),   IR_Down_Theo,
-            K_Star,        Loss_Optimal (abs + %), IR_Down_Optimal,
-            Time_Search_sec,
-            Cont_Reward  (continuous LP baseline for the phase batch)
+            K_Static,       Loss_Static (abs + %),   GIR_Static,
+            K_Theo_Bound,   Loss_Theo_Bound (abs + %), GIR_Theo_Bound,
+            K_Heuristic_DP, Loss_Heuristic_DP (abs + %), GIR_Heuristic_DP,
+            Time_Heuristic_DP_sec,
+            Fluid_Upper_Bound_Reward (phase-level Fluid Upper Bound)
         """
         sep = "=" * 78
 
@@ -979,8 +1050,8 @@ class SimulatorDiscretizer:
 
         print(f"\n{sep}")
         print("  Phase-Lagged DP Scaling Test — three K strategies")
-        print(f"  Fixed K={K_fixed}  |  Theoretical K*=⌈C·N^{{1/5}}⌉  C={C:.4f}")
-        print(f"  Optimal K search (2..{k_search_max}, "
+        print(f"  Static Baseline Grid K={K_fixed}  |  Theoretical K Bound=⌈C·N^{{1/5}}⌉  C={C:.4f}")
+        print(f"  Heuristic DP Grid sweep (2..{k_search_max}, "
               f"stop if improvement < {k_search_threshold_pct}%)")
         print(f"  Fluid LP: C_max={self.simulator.C_max}  T={self.simulator.T}h")
         print(f"  λ1={lambda_1:.3f}  λ2={lambda_2:.3f}  λ3={self.simulator.l3:.3f}")
@@ -1012,7 +1083,7 @@ class SimulatorDiscretizer:
             batch_v   = batch_df[v_col].values.astype(float)
             batch_phi = batch_df[phi_col].values.astype(float)
 
-            # ── Continuous LP baseline for this phase (upper bound) ───────────
+            # ── Theoretical Upper Bound for this phase ─────────────────────────
             # Run LP with raw continuous v/phi to get R_cont for this batch.
             batch_df["v_cont"]   = batch_v
             batch_df["phi_cont"] = batch_phi
@@ -1026,7 +1097,7 @@ class SimulatorDiscretizer:
             def _eval_strategy(k: int, train_v: np.ndarray, train_phi: np.ndarray):
                 """
                 Fit boundaries on train data (Phase M-1), apply to Phase M,
-                solve discrete LP, return (loss_abs, loss_pct, ir_down, accepted).
+                solve discrete LP, return (loss_abs, loss_pct, gir_count, accepted).
                 No Phase-M data touches the boundary fitting.
                 """
                 disc         = Discretizer(K_bins=k)
@@ -1048,37 +1119,38 @@ class SimulatorDiscretizer:
                 loss_abs  = cont_reward - disc_reward
                 loss_pct  = (loss_abs / cont_reward * 100) if cont_reward > 0 else 0.0
 
-                # IR downgrades: LP excluded a job that continuous LP accepted
+                # Grid-Induced Rejections (GIR): LP excluded a job that the Fluid
+                # Upper Bound accepted.
                 x_cont_phase, _ = self.simulator.run_allocation(
                     test_df, v_col="v_cont", phi_col="phi_cont"
                 )
                 x_disc_phase, _ = self.simulator.run_allocation(
                     test_df, v_col="v_disc", phi_col="phi_disc"
                 )
-                ir_down   = int(np.sum((x_cont_phase > 0) & (x_disc_phase == 0)))
+                gir_count = int(np.sum((x_cont_phase > 0) & (x_disc_phase == 0)))
                 accepted  = int(np.sum(x_disc_phase > 0))
 
-                return loss_abs, loss_pct, ir_down, accepted
+                return loss_abs, loss_pct, gir_count, accepted
 
-            # ── Strategy 1: Fixed K ───────────────────────────────────────────
+            # ── Strategy 1: Static Baseline Grid ──────────────────────────────
             t0 = time.perf_counter()
-            loss_fixed, pct_fixed, ir_fixed, acc_fixed = _eval_strategy(
+            loss_fixed, pct_fixed, gir_fixed, acc_fixed = _eval_strategy(
                 K_fixed, train_v_prev, train_phi_prev
             )
             time_fixed = time.perf_counter() - t0
 
-            # ── Strategy 2: Theoretical K* ────────────────────────────────────
+            # ── Strategy 2: Theoretical K Bound ───────────────────────────────
             K_theo = min(
                 Discretizer._theoretical_k(len(train_v_prev), C=C),
                 K_fixed,   # theoretical bound is always ≤ fixed ceiling
             )
             t0 = time.perf_counter()
-            loss_theo, pct_theo, ir_theo, acc_theo = _eval_strategy(
+            loss_theo, pct_theo, gir_theo, acc_theo = _eval_strategy(
                 K_theo, train_v_prev, train_phi_prev
             )
             time_theo = time.perf_counter() - t0
 
-            # ── Strategy 3: Optimal K* search ────────────────────────────────
+            # ── Strategy 3: Heuristic DP Grid ─────────────────────────────────
             # Sweep K on Phase M-1 data (50/50 split to avoid in-sample overfit).
             # The search uses only train_v_prev / train_phi_prev — no Phase-M
             # data is touched.
@@ -1114,57 +1186,57 @@ class SimulatorDiscretizer:
                         break
                 prev_val_err = val_err
 
-            # Clamp: optimal K should never exceed the fixed ceiling
+            # Clamp: heuristic K should never exceed the static baseline ceiling
             best_k_star = min(best_k_star, K_fixed)
             time_search = time.perf_counter() - t0_search
 
-            # Now evaluate on Phase M with the found K*
-            loss_opt, pct_opt, ir_opt, acc_opt = _eval_strategy(
+            # Now evaluate on Phase M with the selected heuristic K.
+            loss_opt, pct_opt, gir_opt, acc_opt = _eval_strategy(
                 best_k_star, train_v_prev, train_phi_prev
             )
 
             # ── Print phase summary ───────────────────────────────────────────
             print(f"\n  Phase {phase}  |  N={actual_n:,}  "
-                  f"|  Cont. Reward = {cont_reward:.4f}")
-            print(f"    Fixed       (K={K_fixed:3d}):  "
+                  f"|  Fluid Upper Bound Reward = {cont_reward:.4f}")
+            print(f"    Static Baseline Grid (K={K_fixed:3d}):  "
                   f"Loss={loss_fixed:10.4f} ({pct_fixed:5.2f}%)  "
-                  f"|  IR↓={ir_fixed}  acc={acc_fixed}  "
+                  f"|  GIR={gir_fixed}  acc={acc_fixed}  "
                   f"|  Time={time_fixed:.4f}s")
-            print(f"    Theoretical (K={K_theo:3d}):  "
+            print(f"    Theoretical K Bound (K={K_theo:3d}):  "
                   f"Loss={loss_theo:10.4f} ({pct_theo:5.2f}%)  "
-                  f"|  IR↓={ir_theo}  acc={acc_theo}  "
+                  f"|  GIR={gir_theo}  acc={acc_theo}  "
                   f"|  Time={time_theo:.4f}s")
-            print(f"    Optimal K*  (K={best_k_star:3d}):  "
+            print(f"    Heuristic DP Grid (K={best_k_star:3d}):  "
                   f"Loss={loss_opt:10.4f} ({pct_opt:5.2f}%)  "
-                  f"|  IR↓={ir_opt}  acc={acc_opt}  "
+                  f"|  GIR={gir_opt}  acc={acc_opt}  "
                   f"|  Search={time_search:.4f}s "
                   f"(converged K={best_k_star}, max={k_search_max})")
 
             rows.append({
                 "Phase":             phase,
                 "Batch_Size":        actual_n,
-                "Cont_Reward":       cont_reward,
-                # Fixed K
-                "K_Fixed":           K_fixed,
-                "Loss_Fixed":        loss_fixed,
-                "Loss_Fixed_pct":    pct_fixed,
-                "IR_Down_Fixed":     ir_fixed,
-                "Accepted_Fixed":    acc_fixed,
-                "Time_Fixed_sec":    time_fixed,
-                # Theoretical K
-                "K_Theo":            K_theo,
-                "Loss_Theo":         loss_theo,
-                "Loss_Theo_pct":     pct_theo,
-                "IR_Down_Theo":      ir_theo,
-                "Accepted_Theo":     acc_theo,
-                "Time_Theo_sec":     time_theo,
-                # Optimal K*
-                "K_Star":            best_k_star,
-                "Loss_Optimal":      loss_opt,
-                "Loss_Optimal_pct":  pct_opt,
-                "IR_Down_Optimal":   ir_opt,
-                "Accepted_Optimal":  acc_opt,
-                "Time_Search_sec":   time_search,
+                "Fluid_Upper_Bound_Reward": cont_reward,
+                # Static Baseline Grid
+                "K_Static":              K_fixed,
+                "Loss_Static":           loss_fixed,
+                "Loss_Static_pct":       pct_fixed,
+                "GIR_Static":            gir_fixed,
+                "Accepted_Static":       acc_fixed,
+                "Time_Static_sec":       time_fixed,
+                # Theoretical K Bound
+                "K_Theo_Bound":          K_theo,
+                "Loss_Theo_Bound":       loss_theo,
+                "Loss_Theo_Bound_pct":   pct_theo,
+                "GIR_Theo_Bound":        gir_theo,
+                "Accepted_Theo_Bound":   acc_theo,
+                "Time_Theo_Bound_sec":   time_theo,
+                # Heuristic DP Grid
+                "K_Heuristic_DP":        best_k_star,
+                "Loss_Heuristic_DP":     loss_opt,
+                "Loss_Heuristic_DP_pct": pct_opt,
+                "GIR_Heuristic_DP":      gir_opt,
+                "Accepted_Heuristic_DP": acc_opt,
+                "Time_Heuristic_DP_sec": time_search,
             })
 
             # ── Slide the window: Phase M becomes Phase M-1 ──────────────────
@@ -1175,20 +1247,540 @@ class SimulatorDiscretizer:
         # ── Summary ──────────────────────────────────────────────────────────
         results = pd.DataFrame(rows)
         if len(results) > 0:
+            # Legacy aliases for backward compatibility with previous notebooks
+            # and scripts that still rely on the old notation.
+            results["Theo_Upper_Bound_Reward"] = results["Fluid_Upper_Bound_Reward"]
+            results["Cont_Reward"] = results["Fluid_Upper_Bound_Reward"]
+
+            results["K_Fixed"] = results["K_Static"]
+            results["Loss_Fixed"] = results["Loss_Static"]
+            results["Loss_Fixed_pct"] = results["Loss_Static_pct"]
+            results["IR_Down_Fixed"] = results["GIR_Static"]
+            results["IR_Down_Static"] = results["GIR_Static"]
+            results["Accepted_Fixed"] = results["Accepted_Static"]
+            results["Time_Fixed_sec"] = results["Time_Static_sec"]
+
+            results["K_Theo"] = results["K_Theo_Bound"]
+            results["Loss_Theo"] = results["Loss_Theo_Bound"]
+            results["Loss_Theo_pct"] = results["Loss_Theo_Bound_pct"]
+            results["IR_Down_Theo"] = results["GIR_Theo_Bound"]
+            results["IR_Down_Theo_Bound"] = results["GIR_Theo_Bound"]
+            results["Accepted_Theo"] = results["Accepted_Theo_Bound"]
+            results["Time_Theo_sec"] = results["Time_Theo_Bound_sec"]
+
+            results["K_Star"] = results["K_Heuristic_DP"]
+            results["Loss_Optimal"] = results["Loss_Heuristic_DP"]
+            results["Loss_Optimal_pct"] = results["Loss_Heuristic_DP_pct"]
+            results["IR_Down_Optimal"] = results["GIR_Heuristic_DP"]
+            results["IR_Down_Heuristic_DP"] = results["GIR_Heuristic_DP"]
+            results["Accepted_Optimal"] = results["Accepted_Heuristic_DP"]
+            results["Time_Search_sec"] = results["Time_Heuristic_DP_sec"]
+
+        if len(results) > 0:
             print(f"\n{sep}")
             print(f"  TOTALS ACROSS {len(results)} PHASES")
             print(f"{sep}")
             for label, loss_col in [
-                (f"Fixed        K={K_fixed}", "Loss_Fixed"),
-                ("Theoretical  K=⌈C·N^1/5⌉", "Loss_Theo"),
-                (f"Optimal K*   (search 2..{k_search_max})", "Loss_Optimal"),
+                (f"Static Baseline Grid  K={K_fixed}", "Loss_Static"),
+                ("Theoretical K Bound   K=⌈C·N^1/5⌉", "Loss_Theo_Bound"),
+                (f"Heuristic DP Grid     (search 2..{k_search_max})", "Loss_Heuristic_DP"),
             ]:
                 total_loss = results[loss_col].sum()
-                total_cont = results["Cont_Reward"].sum()
+                total_cont = results["Fluid_Upper_Bound_Reward"].sum()
                 overall_pct = (total_loss / total_cont * 100) if total_cont > 0 else 0.0
                 print(f"  {label}:  "
                       f"Total Loss={total_loss:12.4f}  "
-                      f"({overall_pct:.2f}% of total continuous reward)")
+                      f"({overall_pct:.2f}% of total Fluid Upper Bound reward)")
+            print(f"{sep}\n")
+
+        return results
+
+    # ------------------------------------------------------------------
+    # 2 × 5 Matrix: Geometric vs DP  ×  {K=32, K=64, K=128, Theo (DP), Heuristic}
+    # ------------------------------------------------------------------
+
+    def run_2x3_matrix_test(
+        self,
+        df:               pd.DataFrame,
+        v_col:            str   = "v_rate",
+        phi_col:          str   = "phi_rate",
+        phase_size:       int   = 50,
+        static_ks:        list[int] = None,
+        k_heuristic_max:  int   = 256,
+        k_search_threshold_pct: float = 1.0,
+        C:                float | None = None,
+        lambda_1:         float = 1 / 3,
+        lambda_2:         float = 1 / 3,
+        n_phases:         int | None = None,
+        seed:             int   = 42,
+        verbose:          bool  = True,
+    ) -> pd.DataFrame:
+        """
+        Full 2 × 5 discretization cost-benefit matrix.
+
+        Spacing algorithms (rows)
+        ─────────────────────────
+        • Geometric  — O(N log N) geomspace edges, no fitting required.
+        • DP Grid    — O(K · N²) optimal bin boundaries fitted on Phase M-1.
+
+        K-selection strategies (columns)
+        ─────────────────────────────────
+        • Static K=32 / K=64 / K=128  — fixed, no search.
+        • Theoretical K  (DP only)    — K* = ⌈C · N^{1/5}⌉, calibrated in Phase 0.
+        • Heuristic K                 — independent sweep for each spacing:
+            - Geometric heuristic: sweeps K=2..k_heuristic_max on Phase M-1;
+              loss = Σ(v - v_disc) + Σ(phi - phi_disc) on a 50/50 val split;
+              stops when marginal improvement < k_search_threshold_pct %.
+            - DP heuristic:        same sweep but uses DP boundaries on the
+              same val split; no cap other than k_heuristic_max.
+
+        Timing (isolated)
+        ─────────────────
+        Each cell records TWO timings:
+          t_spacing_ms — time to compute the discrete v/phi arrays only
+                         (geomspace+digitize  OR  DP fitting + apply).
+                         This is the "algorithm cost" that differs between rows.
+          t_lp_ms      — time to solve the two linprog calls (cont + disc).
+                         This is the same oracle cost for both rows and should
+                         be approximately equal; reported for completeness.
+
+        Phase pipeline (strict no-leakage)
+        ────────────────────────────────────
+        • Phase 0 (warm-up): draws ``phase_size`` jobs; calibrates C for the
+          Theoretical K column; produces initial boundaries for Phase 1.
+        • Phase M (M ≥ 1): draws the NEXT ``phase_size`` jobs (fixed size).
+          Boundaries / heuristic K are always fitted on Phase M-1 data only.
+          Phase-M data is never seen during boundary fitting.
+
+        Parameters
+        ──────────
+        df                    : full job DataFrame.
+        v_col, phi_col        : valuation and virtual-value column names.
+        phase_size            : fixed number of jobs per phase (default 50).
+        static_ks             : list of fixed K values (default [32, 64, 128]).
+        k_heuristic_max       : ceiling for heuristic K sweep (default 256).
+        k_search_threshold_pct: early-stop threshold in % (default 1.0).
+        C                     : pre-calibrated constant; if None, Phase-0
+                                calibration is run automatically.
+        lambda_1, lambda_2    : scalarization weights.
+        n_phases              : cap on phases (None = run until data exhausted).
+        seed                  : RNG seed for the shuffle.
+        verbose               : print per-phase summaries.
+
+        Returns
+        ───────
+        pd.DataFrame with one row per phase.  Columns follow the pattern:
+
+            {Geo|DP}_{strategy}_Loss_abs
+            {Geo|DP}_{strategy}_Loss_pct
+            {Geo|DP}_{strategy}_GIR
+            {Geo|DP}_{strategy}_K
+            {Geo|DP}_{strategy}_t_spacing_ms
+            {Geo|DP}_{strategy}_t_lp_ms
+
+        where strategy ∈ {K32, K64, K128, Theo (DP only), Heuristic}.
+        Plus: Phase, Batch_Size, Fluid_Upper_Bound_Reward, t_cont_lp_ms.
+        """
+        if static_ks is None:
+            static_ks = [32, 64, 128]
+
+        sep = "=" * 90
+
+        # ── Shuffle once; consume in fixed-size windows ───────────────────────
+        rng         = np.random.default_rng(seed=seed)
+        shuffle_idx = rng.permutation(len(df))
+        df_sh       = df.iloc[shuffle_idx].reset_index(drop=True)
+
+        v_all   = df_sh[v_col].values.astype(float)
+        phi_all = df_sh[phi_col].values.astype(float)
+
+        # ── Phase 0: calibrate C on the first batch ───────────────────────────
+        warmup_v   = v_all[:phase_size]
+        warmup_phi = phi_all[:phase_size]
+
+        if C is None:
+            if verbose:
+                print(f"\n{sep}")
+                print("  Phase-0 calibration (50/50 train/test split) …")
+            C = Discretizer.calibrate_C(
+                v_continuous   = warmup_v,
+                phi_continuous = warmup_phi,
+                warmup_n       = phase_size,
+                k_search_max   = k_heuristic_max,
+                k_search_threshold_pct = k_search_threshold_pct,
+                lambda_1 = lambda_1,
+                lambda_2 = lambda_2,
+                seed     = seed,
+            )
+
+        if verbose:
+            print(f"\n{sep}")
+            print(f"  2×5 DISCRETIZATION MATRIX — phase_size={phase_size}  "
+                  f"K_static={static_ks}  K_heuristic_max={k_heuristic_max}")
+            print(f"  Theoretical K formula: K* = {C:.4f} · N^(1/5)")
+            print(f"  Early-stop threshold: {k_search_threshold_pct}% marginal improvement")
+            print(f"{sep}")
+
+        # ── Helper: apply Geometric spacing and time it separately from LP ────
+        def _geo_discretize(k: int, train_v: np.ndarray, train_phi: np.ndarray,
+                            test_v: np.ndarray, test_phi: np.ndarray
+                            ) -> tuple[np.ndarray, np.ndarray, float]:
+            """
+            Apply Geometric grid at resolution K to test arrays.
+            Edges are derived from the training data range so no leakage occurs.
+            Returns (v_disc, phi_disc, t_spacing_ms).
+            """
+            disc = Discretizer(K_bins=k)
+            t0   = time.perf_counter()
+
+            # Build edges from Phase M-1 range; apply to Phase M values.
+            # _map_to_bins is an instance method, so we call geometric_grid
+            # directly but on the test data (geomspace only needs min/max of
+            # the training range, not the test values themselves).
+            # We reconstruct the edge computation explicitly to time only the
+            # spacing step, not the LP.
+            def _geo_edges(ref_vals: np.ndarray, K: int) -> np.ndarray:
+                valid = ref_vals[ref_vals > 0]
+                if len(valid) == 0:
+                    return np.array([1e-4, 1.0])
+                phi_min = max(valid.min(), 1e-4)
+                phi_max = valid.max()
+                return np.geomspace(phi_min, phi_max, K + 1)
+
+            edges_v   = _geo_edges(train_v,   k)
+            edges_phi = _geo_edges(train_phi, k)
+
+            # Apply: map each positive test value to its lower-bound bin
+            def _apply_geo(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
+                result = values.copy().astype(float)
+                mask   = values > 0
+                if mask.any():
+                    idx = np.digitize(values[mask], edges) - 1
+                    idx = np.clip(idx, 0, k - 1)
+                    result[mask] = edges[idx]
+                return result
+
+            v_disc   = _apply_geo(test_v,   edges_v)
+            phi_disc = _apply_geo(test_phi, edges_phi)
+            t_ms     = (time.perf_counter() - t0) * 1_000
+            return v_disc, phi_disc, t_ms
+
+        # ── Helper: apply DP spacing and time it separately from LP ──────────
+        def _dp_discretize(k: int, train_v: np.ndarray, train_phi: np.ndarray,
+                           test_v: np.ndarray, test_phi: np.ndarray
+                           ) -> tuple[np.ndarray, np.ndarray, float]:
+            """
+            Fit DP boundaries on Phase M-1 and apply to Phase M.
+            Returns (v_disc, phi_disc, t_spacing_ms).
+            """
+            disc = Discretizer(K_bins=k)
+            t0   = time.perf_counter()
+            bv   = disc.get_dp_boundaries(train_v)
+            bp   = disc.get_dp_boundaries(train_phi)
+            v_disc   = disc.apply_boundaries(test_v,   bv)
+            phi_disc = disc.apply_boundaries(test_phi, bp)
+            t_ms     = (time.perf_counter() - t0) * 1_000
+            return v_disc, phi_disc, t_ms
+
+        # ── Helper: run LP on a pre-discretized batch; time the LP only ───────
+        def _run_lp(batch_df: pd.DataFrame,
+                    v_disc: np.ndarray, phi_disc: np.ndarray,
+                    cont_v: np.ndarray, cont_phi: np.ndarray,
+                    ) -> tuple[float, float, int, int, float]:
+            """
+            Solve the discrete LP for one (spacing, K) cell.
+            The continuous LP has already been solved outside this helper
+            (cont_reward and x_cont are passed in via closure).
+            Returns (loss_abs, loss_pct, gir, accepted, t_lp_ms).
+            """
+            tdf = batch_df.copy()
+            tdf["v_disc"]   = v_disc
+            tdf["phi_disc"] = phi_disc
+
+            t0 = time.perf_counter()
+            x_disc, r_disc_arr = self.simulator.run_allocation(
+                tdf, v_col="v_disc", phi_col="phi_disc"
+            )
+            t_lp_ms = (time.perf_counter() - t0) * 1_000
+
+            disc_reward = float(np.sum(r_disc_arr))
+            loss_abs    = cont_reward - disc_reward
+            loss_pct    = (loss_abs / cont_reward * 100) if cont_reward > 0 else 0.0
+            gir         = int(np.sum((x_cont > 0) & (x_disc == 0)))
+            accepted    = int(np.sum(x_disc > 0))
+            return loss_abs, loss_pct, gir, accepted, t_lp_ms
+
+        # ── Helper: Geometric heuristic K search on Phase M-1 val split ──────
+        def _geo_heuristic_k(train_v: np.ndarray, train_phi: np.ndarray,
+                             ) -> tuple[int, float]:
+            """
+            Sweep K=2..k_heuristic_max on a 50/50 split of Phase M-1 data.
+            Loss = Σ(v_val - v_disc) + Σ(phi_val - phi_disc) on the val half.
+            Stops when marginal improvement < k_search_threshold_pct %.
+            Returns (best_k, t_search_ms).
+            """
+            t0      = time.perf_counter()
+            n       = len(train_v)
+            split   = n // 2
+            fit_v,  val_v   = train_v[:split],   train_v[split:]
+            fit_phi, val_phi = train_phi[:split], train_phi[split:]
+
+            best_k   = 2
+            best_err = float("inf")
+            prev_err = float("inf")
+
+            for k in range(2, k_heuristic_max + 1):
+
+                def _geo_edges_inner(ref_vals: np.ndarray) -> np.ndarray:
+                    valid = ref_vals[ref_vals > 0]
+                    if len(valid) == 0:
+                        return np.array([1e-4, 1.0])
+                    return np.geomspace(max(valid.min(), 1e-4), valid.max(), k + 1)
+
+                def _apply_inner(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
+                    res  = values.copy().astype(float)
+                    mask = values > 0
+                    if mask.any():
+                        idx = np.clip(np.digitize(values[mask], edges) - 1, 0, k - 1)
+                        res[mask] = edges[idx]
+                    return res
+
+                ev  = _geo_edges_inner(fit_v)
+                ep  = _geo_edges_inner(fit_phi)
+                vd  = _apply_inner(val_v,   ev)
+                pd_ = _apply_inner(val_phi, ep)
+
+                err = (float(np.sum(val_v[val_v > 0]   - vd[val_v > 0]))   * lambda_1
+                     + float(np.sum(val_phi[val_phi > 0] - pd_[val_phi > 0])) * lambda_2)
+                err = max(err, 0.0)   # guard against tiny negatives from clipping
+
+                if err < best_err:
+                    best_err = err
+                    best_k   = k
+
+                if prev_err < float("inf") and prev_err > 0:
+                    improvement = (prev_err - err) / prev_err * 100
+                    if improvement < k_search_threshold_pct:
+                        break
+                prev_err = err
+
+            return best_k, (time.perf_counter() - t0) * 1_000
+
+        # ── Helper: DP heuristic K search on Phase M-1 val split ─────────────
+        def _dp_heuristic_k(train_v: np.ndarray, train_phi: np.ndarray,
+                            ) -> tuple[int, float]:
+            """
+            Sweep K=2..k_heuristic_max on a 50/50 split of Phase M-1 data.
+            Loss = Σ(v_val - v_disc) + Σ(phi_val - phi_disc) using DP boundaries.
+            Stops when marginal improvement < k_search_threshold_pct %.
+            No cap other than k_heuristic_max.
+            Returns (best_k, t_search_ms).
+            """
+            t0      = time.perf_counter()
+            n       = len(train_v)
+            split   = n // 2
+            fit_v,  val_v   = train_v[:split],   train_v[split:]
+            fit_phi, val_phi = train_phi[:split], train_phi[split:]
+
+            best_k   = 2
+            best_err = float("inf")
+            prev_err = float("inf")
+
+            for k in range(2, k_heuristic_max + 1):
+                disc_k = Discretizer(K_bins=k)
+                bv     = disc_k.get_dp_boundaries(fit_v)
+                bp     = disc_k.get_dp_boundaries(fit_phi)
+                vd     = disc_k.apply_boundaries(val_v,   bv)
+                pd_    = disc_k.apply_boundaries(val_phi, bp)
+
+                err = (float(np.sum(val_v[val_v > 0]   - vd[val_v > 0]))   * lambda_1
+                     + float(np.sum(val_phi[val_phi > 0] - pd_[val_phi > 0])) * lambda_2)
+                err = max(err, 0.0)
+
+                if err < best_err:
+                    best_err = err
+                    best_k   = k
+
+                if prev_err < float("inf") and prev_err > 0:
+                    improvement = (prev_err - err) / prev_err * 100
+                    if improvement < k_search_threshold_pct:
+                        break
+                prev_err = err
+
+            return best_k, (time.perf_counter() - t0) * 1_000
+
+        # ── Main phase loop ───────────────────────────────────────────────────
+        # Phase 0 training data = first batch (warm-up); Phase 1 test = second
+        # batch, etc.  We keep a rolling pointer so every phase has the same
+        # fixed size and never re-uses data.
+        train_v_prev   = v_all[:phase_size]
+        train_phi_prev = phi_all[:phase_size]
+        offset         = phase_size    # Phase 1 starts here
+
+        rows   = []
+        phase  = 0
+
+        while True:
+            phase += 1
+            if n_phases is not None and phase > n_phases:
+                break
+            if offset >= len(df_sh):
+                if verbose:
+                    print(f"\n  Phase {phase}: no data remaining — stopping.")
+                break
+
+            batch_df = df_sh.iloc[offset: offset + phase_size].copy()
+            actual_n = len(batch_df)
+            offset  += actual_n
+
+            if actual_n == 0:
+                break
+
+            batch_v   = batch_df[v_col].values.astype(float)
+            batch_phi = batch_df[phi_col].values.astype(float)
+
+            # ── Continuous LP (Fluid Upper Bound) — timed separately ──────────
+            batch_df["v_cont"]   = batch_v
+            batch_df["phi_cont"] = batch_phi
+
+            t0_cont  = time.perf_counter()
+            x_cont, r_cont_arr = self.simulator.run_allocation(
+                batch_df, v_col="v_cont", phi_col="phi_cont"
+            )
+            t_cont_lp_ms = (time.perf_counter() - t0_cont) * 1_000
+            cont_reward  = float(np.sum(r_cont_arr))
+
+            # ── Heuristic K searches on Phase M-1 (independent per spacing) ──
+            k_geo_h, t_geo_search_ms = _geo_heuristic_k(train_v_prev, train_phi_prev)
+            k_dp_h,  t_dp_search_ms  = _dp_heuristic_k( train_v_prev, train_phi_prev)
+
+            # Theoretical K (DP column only) — no cap beyond k_heuristic_max
+            k_theo = min(
+                Discretizer._theoretical_k(len(train_v_prev), C=C),
+                k_heuristic_max,
+            )
+
+            # ── Evaluate every cell ───────────────────────────────────────────
+            row: dict = {
+                "Phase":                      phase,
+                "Batch_Size":                 actual_n,
+                "Fluid_Upper_Bound_Reward":   cont_reward,
+                "t_cont_lp_ms":               t_cont_lp_ms,
+                # Heuristic K chosen
+                "K_Geo_Heuristic":            k_geo_h,
+                "K_DP_Heuristic":             k_dp_h,
+                "K_Theo":                     k_theo,
+                # Search times (pure spacing search cost, no LP)
+                "Geo_Heuristic_t_search_ms":  t_geo_search_ms,
+                "DP_Heuristic_t_search_ms":   t_dp_search_ms,
+            }
+
+            # Iterate over all (spacing, K) combinations
+            for k_label, k_val, spacing_fn, spacing_name in (
+                # Static columns — Geometric
+                *[(f"K{k}", k, _geo_discretize, "Geo") for k in static_ks],
+                # Static columns — DP
+                *[(f"K{k}", k, _dp_discretize,  "DP")  for k in static_ks],
+                # Theoretical K — DP only
+                ("Theo", k_theo, _dp_discretize, "DP"),
+                # Heuristic K — Geometric
+                ("Heuristic", k_geo_h, _geo_discretize, "Geo"),
+                # Heuristic K — DP
+                ("Heuristic", k_dp_h,  _dp_discretize,  "DP"),
+            ):
+                prefix = f"{spacing_name}_{k_label}"
+
+                v_disc, phi_disc, t_sp = spacing_fn(
+                    k_val, train_v_prev, train_phi_prev, batch_v, batch_phi
+                )
+                loss_abs, loss_pct, gir, acc, t_lp = _run_lp(
+                    batch_df, v_disc, phi_disc, batch_v, batch_phi
+                )
+
+                row[f"{prefix}_Loss_abs"]       = loss_abs
+                row[f"{prefix}_Loss_pct"]       = loss_pct
+                row[f"{prefix}_GIR"]            = gir
+                row[f"{prefix}_Accepted"]        = acc
+                row[f"{prefix}_t_spacing_ms"]   = t_sp
+                row[f"{prefix}_t_lp_ms"]        = t_lp
+
+            rows.append(row)
+
+            if verbose:
+                # Compact per-phase summary
+                print(f"\n  Phase {phase:>4d}  N={actual_n}  "
+                      f"Fluid UB={cont_reward:.4f}  t_cont_LP={t_cont_lp_ms:.1f}ms")
+                print(f"  {'Strategy':<26s}  {'Loss%':>7}  {'GIR':>5}  "
+                      f"{'t_spacing':>10}  {'t_lp':>8}  {'K':>5}")
+                print(f"  {'-'*70}")
+                for k in static_ks:
+                    for sp in ("Geo", "DP"):
+                        pf  = f"{sp}_K{k}"
+                        lbl = f"{sp} Static K={k}"
+                        print(f"  {lbl:<26s}  "
+                              f"{row[f'{pf}_Loss_pct']:>6.2f}%  "
+                              f"{row[f'{pf}_GIR']:>5d}  "
+                              f"{row[f'{pf}_t_spacing_ms']:>9.3f}ms  "
+                              f"{row[f'{pf}_t_lp_ms']:>7.1f}ms  "
+                              f"{k:>5d}")
+                # Theo (DP only)
+                pf = "DP_Theo"
+                print(f"  {'DP  Theoretical K':<26s}  "
+                      f"{row[f'{pf}_Loss_pct']:>6.2f}%  "
+                      f"{row[f'{pf}_GIR']:>5d}  "
+                      f"{row[f'{pf}_t_spacing_ms']:>9.3f}ms  "
+                      f"{row[f'{pf}_t_lp_ms']:>7.1f}ms  "
+                      f"{k_theo:>5d}")
+                # Heuristics
+                for sp, k_h, t_srch in (
+                    ("Geo", k_geo_h, t_geo_search_ms),
+                    ("DP",  k_dp_h,  t_dp_search_ms),
+                ):
+                    pf  = f"{sp}_Heuristic"
+                    lbl = f"{sp}  Heuristic K={k_h}"
+                    print(f"  {lbl:<26s}  "
+                          f"{row[f'{pf}_Loss_pct']:>6.2f}%  "
+                          f"{row[f'{pf}_GIR']:>5d}  "
+                          f"{row[f'{pf}_t_spacing_ms']:>9.3f}ms  "
+                          f"{row[f'{pf}_t_lp_ms']:>7.1f}ms  "
+                          f"{'srch='+str(round(t_srch,1))+'ms':>9s}")
+
+            # ── Advance training window and double batch size ─────────────────
+            train_v_prev   = batch_v
+            train_phi_prev = batch_phi
+            phase_size    *= 2
+
+        # ── Aggregate summary ─────────────────────────────────────────────────
+        results = pd.DataFrame(rows)
+
+        if verbose and len(results) > 0:
+            total_ub = results["Fluid_Upper_Bound_Reward"].sum()
+            print(f"\n{sep}")
+            print(f"  AGGREGATE ACROSS {len(results)} PHASES  "
+                  f"(total Fluid UB reward = {total_ub:.4f})")
+            print(f"  {'Strategy':<30s}  {'TotalLoss':>12}  {'OverallLoss%':>13}  "
+                  f"{'MeanSpacing(ms)':>16}  {'MeanLP(ms)':>11}")
+            print(f"  {'-'*90}")
+
+            report_cols = (
+                [(f"Geo Static K={k}", f"Geo_K{k}") for k in static_ks]
+                + [(f"DP  Static K={k}", f"DP_K{k}")  for k in static_ks]
+                + [("DP  Theoretical K",  "DP_Theo")]
+                + [("Geo Heuristic K",    "Geo_Heuristic")]
+                + [("DP  Heuristic K",    "DP_Heuristic")]
+            )
+            for label, pf in report_cols:
+                lc = f"{pf}_Loss_abs"
+                sc = f"{pf}_t_spacing_ms"
+                lpc = f"{pf}_t_lp_ms"
+                if lc not in results.columns:
+                    continue
+                total_loss   = results[lc].sum()
+                overall_pct  = total_loss / total_ub * 100 if total_ub > 0 else 0.0
+                mean_spacing = results[sc].mean()
+                mean_lp      = results[lpc].mean()
+                print(f"  {label:<30s}  {total_loss:>12.4f}  {overall_pct:>12.2f}%  "
+                      f"{mean_spacing:>15.3f}ms  {mean_lp:>10.1f}ms")
             print(f"{sep}\n")
 
         return results
@@ -1219,7 +1811,8 @@ def generate_synthetic_jobs(
     Generate a synthetic cloud job dataset for testing.
 
     Duration is in hours; resource_req in resource units.
-    phi_v approximates the Myerson virtual value with ~20% IR-violating jobs.
+    phi_v approximates the Myerson virtual value with ~20% jobs having r_j < 0
+    (Grid-Induced Rejections under equal-weight scalarization).
     """
     rng = np.random.default_rng(seed)
 
@@ -1241,6 +1834,7 @@ def generate_synthetic_jobs(
     return df
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 5.  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1249,22 +1843,19 @@ if __name__ == "__main__":
     import os
 
     # ── Configuration ────────────────────────────────────────────────────────
-    K_BINS   = 16           # Number of discrete bins
-    # Per-resource instantaneous capacities
-    CLUSTER_CAPACITY = {"cpu": 230.0, "ram": 130.0}
-    HORIZON  = 744.0        # Time horizon T in hours (31-day month)
-    LAMBDAS  = (1/3, 1/3, 1/3)   # Equal-weight scalarization
+    K_BINS  = 32                  # Number of discrete bins
+    RHO     = 0.6                 # Load factor: budget = rho · Σ A_j · D_j
+    LAMBDAS = (1/3, 1/3, 1/3)    # Equal-weight scalarization
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     DATA_PATH = os.path.join(
-        os.path.dirname(__file__), "..", "data", "processed", "batch_may2019_2k.csv"
+        os.path.dirname(__file__), "..", "data", "processed", "batch_may2019_30k.csv"
     )
 
     print("=" * 78)
-    print("  Discretization Loss via StaticCloudSimulator (Fluid LP / OPT_LP)")
-    print(f"  K={K_BINS}  |  C_max={CLUSTER_CAPACITY}  |  T={HORIZON}h  |  lambdas={LAMBDAS}")
-    budgets = {r: CLUSTER_CAPACITY[r] * HORIZON for r in CLUSTER_CAPACITY}
-    print(f"  Fluid Volume Budgets (resource·hours): {budgets}")
+    print("  Discretization Grid Loss via StaticCloudSimulator (Fluid Upper Bound)")
+    print(f"  K={K_BINS}  |  rho={RHO}  |  lambdas={LAMBDAS}")
+    print(f"  Fluid budget: rho · Σ_j A_j · D_j  (adaptive per dataset)")
     print("=" * 78)
 
     if os.path.exists(DATA_PATH):
@@ -1304,13 +1895,13 @@ if __name__ == "__main__":
         df = generate_synthetic_jobs(n=500, seed=42)
         v_col, phi_col = "v", "phi_v"
         print(f"  Total jobs: {len(df):,}")
-        ir_jobs = int((df[phi_col] > 0).sum())
-        print(f"  IR-valid jobs (phi_v > 0): {ir_jobs:,}")
+        # Count jobs with r_j >= 0 under equal-weight scalarization
+        r_j = (1/3) * df["priority"] * df[phi_col] + (1/3) * (df[phi_col] - df["c_elec"]) - (1/3) * df["c_carbon"]
+        valid_jobs = int((r_j >= 0).sum())
+        print(f"  Scalarized reward valid jobs (r_j >= 0): {valid_jobs:,}")
 
     # ── 1. Full comparison at fixed K ────────────────────────────────────────
-    sd = SimulatorDiscretizer(
-        K_bins=K_BINS, capacity=CLUSTER_CAPACITY, horizon=HORIZON, lambdas=LAMBDAS
-    )
+    sd = SimulatorDiscretizer(K_bins=K_BINS, lambdas=LAMBDAS, rho=RHO)
     summary = sd.compare_all(df, v_col=v_col, phi_col=phi_col, verbose=True)
 
     # ── 2. K-sweep for all three methods ─────────────────────────────────────
@@ -1356,11 +1947,11 @@ if __name__ == "__main__":
 
     print("\nPhase-lagged results table:")
     cols_to_show = [
-        "Phase", "Batch_Size", "Cont_Reward",
-        "K_Fixed",  "Loss_Fixed",   "Loss_Fixed_pct",
-        "K_Theo",   "Loss_Theo",    "Loss_Theo_pct",
-        "K_Star",   "Loss_Optimal", "Loss_Optimal_pct",
-        "Time_Search_sec",
+        "Phase", "Batch_Size", "Fluid_Upper_Bound_Reward",
+        "K_Static",       "Loss_Static",       "Loss_Static_pct", "GIR_Static",
+        "K_Theo_Bound",   "Loss_Theo_Bound",   "Loss_Theo_Bound_pct", "GIR_Theo_Bound",
+        "K_Heuristic_DP", "Loss_Heuristic_DP", "Loss_Heuristic_DP_pct", "GIR_Heuristic_DP",
+        "Time_Heuristic_DP_sec",
     ]
     print(phase_results[cols_to_show].to_string(index=False, float_format="{:.3f}".format))
 
